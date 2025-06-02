@@ -258,7 +258,6 @@ class UniV2X(UniV2XTrack):
         univ2x_outs = {}
         if not self.is_ego_agent:
             univ2x_outs['univ2x_track_instances_list'] = outs_track['univ2x_track_instances_list']
-            univ2x_outs['univ2x_lane_query_data'] = outs_seg['univ2x_lane_query_data']
 
         return losses, univ2x_outs
     

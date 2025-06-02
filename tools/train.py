@@ -21,7 +21,8 @@ from mmdet3d.models import build_model
 from mmdet3d.utils import collect_env, get_root_logger
 from mmdet.apis import set_random_seed
 from mmseg import __version__ as mmseg_version
-
+import sys
+sys.path.append('/media/jvn-server/185A27335A270CD6/fardin/UniV2X')
 warnings.filterwarnings("ignore")
 
 from mmcv.utils import TORCH_VERSION, digit_version
@@ -83,6 +84,10 @@ def parse_args():
         '--autoscale-lr',
         action='store_true',
         help='automatically scale lr with the number of gpus')
+    parser.add_argument(
+        '--amp',
+        action='store_true',
+        help='enable automatic mixed precision training')
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)
@@ -186,6 +191,14 @@ def main():
     logger = get_root_logger(
         log_file=log_file, log_level=cfg.log_level, name=logger_name)
 
+    # enable automatic mixed precision if --amp flag is provided
+    if args.amp:
+        if not hasattr(cfg, 'fp16') or cfg.fp16 is None:
+            cfg.fp16 = dict(loss_scale=512.)
+            logger.info('Enabled automatic mixed precision training with default loss_scale=512')
+        else:
+            logger.info('AMP already configured in config file')
+
     # init the meta dict to record some important information such as
     # environment info and seed, which will be logged
     meta = dict()
@@ -249,6 +262,9 @@ def main():
 
     # build mult_agent model
     model_multi_agents = MultiAgent(model_ego_agent, model_other_agents)
+    
+    # EDIT Load model from checkpoint for multi-agent model
+    checkpoint = load_checkpoint(model_multi_agents, ego_agent_model_pretrained_from, map_location='cpu')
     # if not (other_agent_model_pretrained and ego_agent_model_pretrained):
     #     model_multi_agents.init_weights()
     logger.info(f'Model:\n{model_multi_agents}')

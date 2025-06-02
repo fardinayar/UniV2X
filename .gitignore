@@ -150,3 +150,8 @@ debug/
 projects/work_dirs_*
 val/
 datasets
+param_counts/
+
+*.pyc*
+a.zip
+*/__pycache__/*

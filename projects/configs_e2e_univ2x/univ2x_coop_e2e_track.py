@@ -141,7 +141,7 @@ model_other_agent_inf = dict(
     freeze_img_backbone=True,
     freeze_img_neck=True,
     freeze_bn=True,
-    # freeze_bev_encoder=True,
+    freeze_bev_encoder=True,
     score_thresh=0.4,
     filter_score_thresh=0.35,
     qim_args=dict(
@@ -278,94 +278,7 @@ model_other_agent_inf = dict(
         loss_bbox=dict(type="L1Loss", loss_weight=0.25),
         loss_iou=dict(type="GIoULoss", loss_weight=0.0),
     ),
-    seg_head=dict(
-        type='PansegformerHead',
-        bev_h=bev_h_,
-        bev_w=bev_w_,
-        canvas_size=canvas_size,
-        pc_range=inf_point_cloud_range,
-        num_query=300,
-        num_classes=4,
-        num_things_classes=3,
-        num_stuff_classes=1,
-        in_channels=2048,
-        sync_cls_avg_factor=True,
-        as_two_stage=False,
-        with_box_refine=True,
-        transformer=dict(
-            type='SegDeformableTransformer',
-            encoder=dict(
-                type='DetrTransformerEncoder',
-                num_layers=6,
-                transformerlayers=dict(
-                    type='BaseTransformerLayer',
-                    attn_cfgs=dict(
-                        type='MultiScaleDeformableAttention',
-                        embed_dims=_dim_,
-                        num_levels=_num_levels_,
-                    ),
-                    feedforward_channels=_feed_dim_,
-                    ffn_dropout=0.1,
-                    operation_order=('self_attn', 'norm', 'ffn', 'norm'))),
-            decoder=dict(
-                type='DeformableDetrTransformerDecoder',
-                num_layers=6,
-                return_intermediate=True,
-                transformerlayers=dict(
-                    type='DetrTransformerDecoderLayer',
-                    attn_cfgs=[
-                        dict(
-                            type='MultiheadAttention',
-                            embed_dims=_dim_,
-                            num_heads=8,
-                            dropout=0.1),
-                        dict(
-                            type='MultiScaleDeformableAttention',
-                            embed_dims=_dim_,
-                            num_levels=_num_levels_,
-                        )
-                    ],
-                    feedforward_channels=_feed_dim_,
-                    ffn_dropout=0.1,
-                    operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
-                                     'ffn', 'norm')
-                ),
-            ),
-        ),
-        positional_encoding=dict(
-            type='SinePositionalEncoding',
-            num_feats=_dim_half_,
-            normalize=True,
-            offset=-0.5),
-        loss_cls=dict(
-            type='FocalLoss',
-            use_sigmoid=True,
-            gamma=2.0,
-            alpha=0.25,
-            loss_weight=2.0),
-        loss_bbox=dict(type='L1Loss', loss_weight=5.0),
-        loss_iou=dict(type='GIoULoss', loss_weight=2.0),
-        loss_mask=dict(type='DiceLoss', loss_weight=2.0),
-        thing_transformer_head=dict(type='SegMaskHead', d_model=_dim_, nhead=8, num_decoder_layers=4),
-        stuff_transformer_head=dict(type='SegMaskHead', d_model=_dim_, nhead=8, num_decoder_layers=6, self_attn=True),
-        train_cfg=dict(
-            assigner=dict(
-                type='HungarianAssigner',
-                cls_cost=dict(type='FocalLossCost', weight=2.0),
-                reg_cost=dict(type='BBoxL1Cost', weight=5.0, box_format='xywh'),
-                iou_cost=dict(type='IoUCost', iou_mode='giou', weight=2.0),
-            ),
-            assigner_with_mask=dict(
-                type='HungarianAssigner_multi_info',
-                cls_cost=dict(type='FocalLossCost', weight=2.0),
-                reg_cost=dict(type='BBoxL1Cost', weight=5.0, box_format='xywh'),
-                iou_cost=dict(type='IoUCost', iou_mode='giou', weight=2.0),
-                mask_cost=dict(type='DiceCost', weight=2.0),
-            ),
-            sampler=dict(type='PseudoSampler'),
-            sampler_with_mask=dict(type='PseudoSampler_segformer'),
-        ),
-    ),
+
     # model training and testing settings
     train_cfg=dict(
         pts=dict(
@@ -384,7 +297,7 @@ model_other_agent_inf = dict(
             ),
         )
     ),
-    load_from="ckpts/univ2x_sub_inf_stg2.pth",
+    load_from="ckpts/univ2x_coop_e2e_stg1.pth",
     is_ego_agent=is_ego_agent,
 )
 
@@ -434,7 +347,7 @@ model_ego_agent = dict(
     freeze_img_backbone=True,
     freeze_img_neck=True,
     freeze_bn=True,
-    # freeze_bev_encoder=False,
+    freeze_bev_encoder=True,
     score_thresh=0.4,
     filter_score_thresh=0.35,
     qim_args=dict(
@@ -572,98 +485,6 @@ model_ego_agent = dict(
         loss_bbox=dict(type="L1Loss", loss_weight=0.25),
         loss_iou=dict(type="GIoULoss", loss_weight=0.0),
     ),
-    seg_head=dict(
-        type='PansegformerHead',
-        bev_h=bev_h_,
-        bev_w=bev_w_,
-        canvas_size=canvas_size,
-        pc_range=point_cloud_range,
-        inf_pc_range=inf_point_cloud_range,
-        is_cooperation=True,
-        is_bev_aug=True,
-        num_query=300,
-        num_classes=4,
-        num_things_classes=3,
-        num_stuff_classes=1,
-        in_channels=2048,
-        sync_cls_avg_factor=True,
-        as_two_stage=False,
-        with_box_refine=True,
-        transformer=dict(
-            type='SegDeformableTransformer',
-            encoder=dict(
-                type='DetrTransformerEncoder',
-                num_layers=6,
-                transformerlayers=dict(
-                    type='BaseTransformerLayer',
-                    attn_cfgs=dict(
-                        type='MultiScaleDeformableAttention',
-                        embed_dims=_dim_,
-                        num_levels=_num_levels_,
-                    ),
-                    feedforward_channels=_feed_dim_,
-                    ffn_dropout=0.1,
-                    operation_order=('self_attn', 'norm', 'ffn', 'norm'))),
-            decoder=dict(
-                type='DeformableDetrTransformerDecoder',
-                num_layers=6,
-                return_intermediate=True,
-                transformerlayers=dict(
-                    type='DetrTransformerDecoderLayer',
-                    attn_cfgs=[
-                        dict(
-                            type='MultiheadAttention',
-                            embed_dims=_dim_,
-                            num_heads=8,
-                            dropout=0.1),
-                        dict(
-                            type='MultiScaleDeformableAttention',
-                            embed_dims=_dim_,
-                            num_levels=_num_levels_,
-                        )
-                    ],
-                    feedforward_channels=_feed_dim_,
-                    ffn_dropout=0.1,
-                    operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
-                                     'ffn', 'norm')
-                ),
-            ),
-        ),
-        positional_encoding=dict(
-            type='SinePositionalEncoding',
-            num_feats=_dim_half_,
-            normalize=True,
-            offset=-0.5),
-        loss_cls=dict(
-            type='FocalLoss',
-            use_sigmoid=True,
-            gamma=2.0,
-            alpha=0.25,
-            loss_weight=2.0),
-        loss_bbox=dict(type='L1Loss', loss_weight=5.0),
-        loss_iou=dict(type='GIoULoss', loss_weight=2.0),
-        loss_mask=dict(type='DiceLoss', loss_weight=2.0),
-        thing_transformer_head=dict(type='SegMaskHead', d_model=_dim_, nhead=8, num_decoder_layers=4),
-        stuff_transformer_head=dict(type='SegMaskHead', d_model=_dim_, nhead=8, num_decoder_layers=6, self_attn=True),
-        train_cfg=dict(
-            assigner=dict(
-                type='HungarianAssigner',
-                cls_cost=dict(type='FocalLossCost', weight=2.0),
-                reg_cost=dict(type='BBoxL1Cost', weight=5.0, box_format='xywh'),
-                iou_cost=dict(type='IoUCost', iou_mode='giou', weight=2.0),
-            ),
-            assigner_with_mask=dict(
-                type='HungarianAssigner_multi_info',
-                cls_cost=dict(type='FocalLossCost', weight=2.0),
-                reg_cost=dict(type='BBoxL1Cost', weight=5.0, box_format='xywh'),
-                iou_cost=dict(type='IoUCost', iou_mode='giou', weight=2.0),
-                mask_cost=dict(type='DiceCost', weight=2.0),
-            ),
-            sampler=dict(type='PseudoSampler'),
-            sampler_with_mask=dict(type='PseudoSampler_segformer'),
-        ),
-    ),
-
     # model training and testing settings
     train_cfg=dict(
         pts=dict(
@@ -682,7 +503,7 @@ model_ego_agent = dict(
             ),
         )
     ),
-    load_from="ckpts/univ2x_sub_veh_stg1.pth", # You can also choose ckpts/univ2x_sub_veh_stg2.pth.
+    load_from="ckpts/univ2x_coop_e2e_stg1.pth", # You can also choose ckpts/univ2x_sub_veh_stg2.pth.
     is_ego_agent=is_ego_agent,
 )
 
@@ -701,7 +522,7 @@ ann_file_test = info_root + f"spd_infos_temporal_val.pkl"
 
 split_datas_file = "./data/split_datas/cooperative-split-data-spd.json"
 v2x_side = 'cooperative'
-eval_mod = ['det', 'map', 'track']
+eval_mod = ['det', 'track']
 
 train_pipeline = [
     dict(type="LoadMultiViewImageFromFilesInCeph", to_float32=True, file_client_args=file_client_args, img_root=data_root),
@@ -952,18 +773,13 @@ optimizer = dict(
 )
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
 # learning policy
-lr_config = dict(
-    policy="CosineAnnealing",
-    warmup="linear",
-    warmup_iters=500,
-    warmup_ratio=1.0 / 3,
-    min_lr_ratio=1e-3,
-)
-total_epochs = 20
-evaluation = dict(interval=2, pipeline=test_pipeline)
+lr_config = dict(policy='fixed')
+
+total_epochs = 10
+evaluation = dict(interval=1, pipeline=test_pipeline)
 runner = dict(type="EpochBasedRunner", max_epochs=total_epochs)
 log_config = dict(
-    interval=10, hooks=[dict(type="TextLoggerHook"), dict(type="TensorboardLoggerHook")]
+    interval=1, hooks=[dict(type="TextLoggerHook"), dict(type="TensorboardLoggerHook")]
 )
 checkpoint_config = dict(interval=2)
 

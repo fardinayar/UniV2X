@@ -10,7 +10,8 @@ from mmcv.cnn import fuse_conv_bn
 from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
 from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,
                          wrap_fp16_model)
-
+import sys
+sys.path.append('/media/jvn-server/185A27335A270CD6/fardin/UniV2X')
 from mmdet3d.apis import single_gpu_test
 from mmdet3d.datasets import build_dataset
 from projects.mmdet3d_plugin.datasets.builder import build_dataloader
@@ -245,9 +246,8 @@ def main():
         model_multi_agents.model_ego_agent.PALETTE = dataset.PALETTE
 
     if not distributed:
-        assert False
-        # model = MMDataParallel(model_multi_agents, device_ids=[0])
-        # outputs = single_gpu_test(model_multi_agents, data_loader, args.show, args.show_dir)
+        model = MMDataParallel(model_multi_agents, device_ids=[0])
+        outputs = single_gpu_test(model, data_loader, args.show, args.show_dir)
     else:
         model_multi_agents = MMDistributedDataParallel(
             model_multi_agents.cuda(),
