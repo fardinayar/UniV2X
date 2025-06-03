@@ -14,18 +14,44 @@ from ..dense_heads.track_head_plugin import Instances
 
 class AgentQueryFusion(nn.Module):
 
-    def __init__(self, pc_range, embed_dims=256):
+    def __init__(self, pc_range, embed_dims=256, fusion_mode='attention', 
+                 num_attention_heads=8, attention_dropout=0.1, feedforward_dim=None):
         super(AgentQueryFusion, self).__init__()
 
         self.pc_range = pc_range
         self.embed_dims = embed_dims
+        self.fusion_mode = fusion_mode
+        
+        assert fusion_mode in ['addition', 'attention'], \
+            f"fusion_mode must be 'addition' or 'attention', got {fusion_mode}"
 
         # reference_points ---> pos_embed
         self.get_pos_embedding = nn.Linear(3, self.embed_dims)
         # cross-agent feature alignment
         self.cross_agent_align = nn.Linear(self.embed_dims+9, self.embed_dims)
         self.cross_agent_align_pos = nn.Linear(self.embed_dims+9, self.embed_dims)
-        self.cross_agent_fusion = nn.Linear(self.embed_dims, self.embed_dims)
+        
+        if self.fusion_mode == 'addition':
+            # Original simple fusion
+            self.cross_agent_fusion = nn.Linear(self.embed_dims, self.embed_dims)
+        else:
+            # Attention-based fusion
+            if feedforward_dim is None:
+                feedforward_dim = 4 * self.embed_dims
+            
+            self.attention_layer = nn.TransformerDecoderLayer(
+                d_model=self.embed_dims,
+                nhead=num_attention_heads,
+                dim_feedforward=feedforward_dim,
+                dropout=attention_dropout,
+                batch_first=True
+            )
+            
+            # Position and type embeddings for different agents
+            self.pos_embed = nn.Linear(3, self.embed_dims)
+            
+            self.inf_type_embed = nn.Parameter(torch.randn(1, 1, self.embed_dims))
+            self.veh_type_embed = nn.Parameter(torch.randn(1, 1, self.embed_dims))
 
         # parameter initialization
         for p in self.parameters():
@@ -87,11 +113,35 @@ class AgentQueryFusion(nn.Module):
 
         return idx_veh, idx_inf, cost_matrix
     
+    def attention_fusion(self, inf_features, veh_features, inf_pts, veh_pts, attention_mask):
+        """
+        Attention-based fusion of infrastructure and vehicle features.
+        
+        Args:
+            inf_features (torch.Tensor): Infrastructure features [N, D]
+            veh_features (torch.Tensor): Vehicle features [N, D]
+        
+        Returns:
+            torch.Tensor: Fused features [N, D]
+        """
+        B, N, D = inf_features.shape
+        
+        # Add positional and type embeddings
+        inf_feats_emb = inf_features + self.inf_type_embed + self.pos_embed(inf_pts) # [N, 1, D]
+        veh_feats_emb = veh_features + self.veh_type_embed + self.pos_embed(veh_pts)  # [N, 1, D]
+        
+        
+        # Apply transformer attention
+        attended_feats = self.attention_layer(veh_feats_emb, inf_feats_emb, memory_mask=attention_mask.cuda())  # [N, 2, D]
+        
+
+        return attended_feats
+    
     def _query_fusion(self, inf, veh, inf_idx, veh_idx, cost_matrix):
         """
         Query fusion: 
             replacement for scores, ref_pts and pos_embed according to confidence_score
-            fusion for features via MLP
+            fusion for features via MLP or Attention
         
         inf: Instance from infrastructure
         veh: Instance from vehicle
@@ -107,8 +157,30 @@ class AgentQueryFusion(nn.Module):
             if cost_matrix[veh_idx[i]][inf_idx[i]] < 1e5:
                 veh_accept_idx.append(veh_idx[i])
                 inf_accept_idx.append(inf_idx[i])
-                veh.query[veh_idx[i], self.embed_dims:] = veh.query[veh_idx[i], self.embed_dims:] + self.cross_agent_fusion(inf.query[inf_idx[i], self.embed_dims:])
+                
+                if self.fusion_mode == 'addition':
+                    # Original simple addition-based fusion
+                    veh.query[veh_idx[i], self.embed_dims:] = veh.query[veh_idx[i], self.embed_dims:] + self.cross_agent_fusion(inf.query[inf_idx[i], self.embed_dims:])
         
+        if self.fusion_mode == 'attention':
+            # Attention-based fusion
+            inf_feat = inf.query[:, self.embed_dims:].unsqueeze(0)  # [1, D]
+            veh_feat = veh.query[:, self.embed_dims:].unsqueeze(0)  # [1, D]
+            
+            cost_matrix = torch.as_tensor(cost_matrix)
+            attention_mask = cost_matrix < 1e5
+            
+            inf_pts = inf.ref_pts
+            veh_pts = veh.ref_pts
+            # Apply attention fusion
+            fused_feat = self.attention_fusion(inf_feat, veh_feat, inf_pts, veh_pts, attention_mask)  # [1, D]
+            
+            # Update vehicle query with fused features
+            veh.query = torch.cat([
+                veh.query[:, :self.embed_dims], 
+                veh.query[:, self.embed_dims:] + fused_feat.squeeze(0)
+            ], dim=1)
+
         return veh, veh_accept_idx, inf_accept_idx
     
 
@@ -190,7 +262,7 @@ class AgentQueryFusion(nn.Module):
         inf.query[..., :self.embed_dims] = self.cross_agent_align_pos(torch.cat([inf.query[..., :self.embed_dims],inf2veh_r], -1))
         inf.query[..., self.embed_dims:] = self.cross_agent_align(torch.cat([inf.query[..., self.embed_dims:],inf2veh_r], -1))
 
-        # cross-agent query fusion
+        # cross-agent query fusion (supports both addition and attention modes)
         veh, veh_accept_idx, inf_accept_idx = self._query_fusion(inf, veh, inf_idx, veh_idx, cost_matrix)
 
         # cross-agent query complementation

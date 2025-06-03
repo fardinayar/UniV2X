@@ -22,7 +22,7 @@ from mmdet3d.utils import collect_env, get_root_logger
 from mmdet.apis import set_random_seed
 from mmseg import __version__ as mmseg_version
 import sys
-sys.path.append('/media/jvn-server/185A27335A270CD6/fardin/UniV2X')
+sys.path.append('/home/tlab/fardin/UniV2X')
 warnings.filterwarnings("ignore")
 
 from mmcv.utils import TORCH_VERSION, digit_version
