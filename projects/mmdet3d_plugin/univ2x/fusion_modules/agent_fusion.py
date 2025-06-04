@@ -176,10 +176,7 @@ class AgentQueryFusion(nn.Module):
             fused_feat = self.attention_fusion(inf_feat, veh_feat, inf_pts, veh_pts, attention_mask)  # [1, D]
             
             # Update vehicle query with fused features
-            veh.query = torch.cat([
-                veh.query[:, :self.embed_dims], 
-                veh.query[:, self.embed_dims:] + fused_feat.squeeze(0)
-            ], dim=1)
+            veh.query[:, self.embed_dims:] = veh.query[:, self.embed_dims:] + fused_feat.squeeze(0)
 
         return veh, veh_accept_idx, inf_accept_idx
     
