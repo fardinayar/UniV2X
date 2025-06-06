@@ -226,7 +226,12 @@ def custom_multi_gpu_test_wo_label(model, data_loader, tmpdir=None, gpu_collect=
         with torch.no_grad():
             result = model(return_loss=False, rescale=True, w_label=False, **data)
             
-            result[0]['planning_traj'] = result[0]['planning']['result_planning']['sdc_traj']
+            # Only add planning_traj if planning results exist
+            if 'planning' in result[0] and 'result_planning' in result[0]['planning']:
+                result[0]['planning_traj'] = result[0]['planning']['result_planning']['sdc_traj']
+            else:
+                # For wo_label inference, planning might not be available
+                result[0]['planning_traj'] = None
 
             # command_list[result[0]['token']] = data['ego_agent_data']['command']
 
@@ -252,9 +257,13 @@ def custom_multi_gpu_test_wo_label(model, data_loader, tmpdir=None, gpu_collect=
                     have_mask = True
             else:
                 batch_size = len(result)
-                for key in ['planning', 'track_bbox_results', 'sdc_boxes_3d', 'sdc_scores_3d', 
-                            'sdc_track_scores', 'sdc_track_bbox_results', 'traj_0', 'traj_scores_0', 'traj_1', 'traj_scores_1', 'traj', 'traj_scores']:
-                    del result[0][key]
+                # Remove keys that might not exist in wo_label inference
+                keys_to_remove = ['planning', 'track_bbox_results', 'sdc_boxes_3d', 'sdc_scores_3d', 
+                                'sdc_track_scores', 'sdc_track_bbox_results', 'traj_0', 'traj_scores_0', 
+                                'traj_1', 'traj_scores_1', 'traj', 'traj_scores']
+                for key in keys_to_remove:
+                    if key in result[0]:
+                        del result[0][key]
                 bbox_results.extend(result)
 
         if rank == 0:

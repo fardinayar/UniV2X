@@ -8,7 +8,7 @@ export MASTER_PORT=29502
 
 # 运行 Python 推理脚本
 python tools/inference.py \
-    projects/configs_e2e_univ2x/univ2x_coop_e2e_old_mode_inference_wo_label.py \
-    ckpts/univ2x_coop_e2e_stg2_old_mode_inference_only.pth \
+    projects/configs_e2e_univ2x/univ2x_coop_e2e_track_wo_label.py \
+    work_dirs/univ2x_coop_e2e_track/epoch_4.pth \
     --out output/results_to_submit.pkl \
     --launcher pytorch
