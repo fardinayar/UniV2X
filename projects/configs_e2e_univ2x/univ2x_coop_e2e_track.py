@@ -763,7 +763,7 @@ data = dict(
 #------------------------------------------------------------------------------------------------------------------#
 optimizer = dict(
     type="AdamW",
-    lr=2e-6,
+    lr=2e-5,
     paramwise_cfg=dict(
         custom_keys={
             "img_backbone": dict(lr_mult=0.1),
@@ -771,16 +771,21 @@ optimizer = dict(
     ),
     weight_decay=0.01,
 )
-optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
+optimizer_config = dict(grad_clip=dict(max_norm=10, norm_type=2))
 # learning policy
-lr_config = dict(policy='fixed')
-
+lr_config = dict(
+    policy="CosineAnnealing",
+    warmup="linear",
+    warmup_iters=100,
+    warmup_ratio=1.0 / 3,
+    min_lr_ratio=1e-3,
+)
 total_epochs = 10
 evaluation = dict(interval=1, pipeline=test_pipeline)
 runner = dict(type="EpochBasedRunner", max_epochs=total_epochs)
 log_config = dict(
     interval=1, hooks=[dict(type="TextLoggerHook"), dict(type="TensorboardLoggerHook")]
 )
-checkpoint_config = dict(interval=2)
+checkpoint_config = dict(interval=1)
 
 find_unused_parameters = True

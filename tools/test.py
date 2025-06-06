@@ -11,7 +11,7 @@ from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
 from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,
                          wrap_fp16_model)
 import sys
-sys.path.append('/home/tlab/fardin/UniV2X')
+sys.path.append('/media/jvn-server/185A27335A270CD6/fardin/UniV2X/')
 from mmdet3d.apis import single_gpu_test
 from mmdet3d.datasets import build_dataset
 from projects.mmdet3d_plugin.datasets.builder import build_dataloader

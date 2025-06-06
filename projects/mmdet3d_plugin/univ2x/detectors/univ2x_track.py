@@ -82,7 +82,10 @@ class UniV2XTrack(MVXTwoStageDetector):
         is_ego_agent=False,
         return_track_query=True,
         save_track_query=False,
-        save_track_query_file_root=''
+        save_track_query_file_root='',
+        use_multiscale_query=True,
+        num_query_scales=3,
+        query_scale_jitter=0.1,
     ):
         super(UniV2XTrack, self).__init__(
             img_backbone=img_backbone,
@@ -179,6 +182,111 @@ class UniV2XTrack(MVXTwoStageDetector):
 
         self.is_ego_agent = is_ego_agent
         self.return_track_query = return_track_query
+
+        self.use_multiscale_query = use_multiscale_query
+        self.num_query_scales = num_query_scales
+        self.query_scale_jitter = query_scale_jitter
+
+    def _get_multiscale_queries(self, track_instances):
+        if not self.use_multiscale_query:
+            return track_instances.query, track_instances.ref_pts, 0, 0
+
+        object_query_embeds = track_instances.query
+        ref_points = track_instances.ref_pts
+        
+        # Separate object queries and ego query
+        obj_queries = object_query_embeds[:-1]
+        ego_query = object_query_embeds[-1:]
+        obj_ref_pts = ref_points[:-1]
+        ego_ref_pt = ref_points[-1:]
+
+        num_obj_queries = len(obj_queries)
+
+        # Expand object queries
+        object_query_embeds_expanded = obj_queries.repeat(self.num_query_scales, 1)
+        num_queries_expanded = len(object_query_embeds_expanded)
+
+        # Generate multi-scale reference points by jittering
+        all_obj_ref_pts = [obj_ref_pts]
+        ref_pts_sigmoid = obj_ref_pts.sigmoid()
+        for _ in range(self.num_query_scales - 1):
+            shift = (torch.rand_like(ref_pts_sigmoid) - 0.5) * 2 * self.query_scale_jitter
+            new_ref_pts_sigmoid = (ref_pts_sigmoid + shift).clamp(0, 1)
+            new_ref_pts = inverse_sigmoid(new_ref_pts_sigmoid)
+            all_obj_ref_pts.append(new_ref_pts)
+        
+        ref_points_expanded = torch.cat(all_obj_ref_pts, dim=0)
+        
+        # Combine with ego query (which is not expanded)
+        final_query_embeds = torch.cat([object_query_embeds_expanded, ego_query], dim=0)
+        final_ref_points = torch.cat([ref_points_expanded, ego_ref_pt], dim=0)
+
+        return final_query_embeds, final_ref_points, num_queries_expanded, num_obj_queries
+
+    def _multiscale_query_fusion(self, det_output, num_queries_expanded, num_obj_queries):
+        if not self.use_multiscale_query:
+            return det_output
+        
+        output_classes = det_output["all_cls_scores"]
+        output_coords = det_output["all_bbox_preds"]
+        query_feats = det_output["query_feats"]
+        last_ref_pts = det_output["last_ref_points"]
+        all_past_trajs = det_output["all_past_traj_preds"]
+
+        num_dec_layers, bs, _, num_cls = output_classes.shape
+        _, _, _, box_dim = output_coords.shape
+        _, _, _, C = query_feats.shape
+        _, _, _, past_steps, traj_dim = all_past_trajs.shape
+
+        num_queries_before_expansion = num_obj_queries
+
+        # Separate object and ego outputs
+        obj_output_classes = output_classes[:, :, :num_queries_expanded]
+        ego_output_classes = output_classes[:, :, num_queries_expanded:]
+        obj_output_coords = output_coords[:, :, :num_queries_expanded]
+        ego_output_coords = output_coords[:, :, num_queries_expanded:]
+        obj_query_feats = query_feats[:, :, :num_queries_expanded]
+        ego_query_feats = query_feats[:, :, num_queries_expanded:]
+        obj_past_trajs = all_past_trajs[:, :, :num_queries_expanded]
+        ego_past_trajs = all_past_trajs[:, :, num_queries_expanded:]
+        obj_last_ref_pts = last_ref_pts[:, :num_queries_expanded]
+        ego_last_ref_pt = last_ref_pts[:, num_queries_expanded:]
+
+        # Reshape
+        obj_output_classes = obj_output_classes.reshape(num_dec_layers, bs, self.num_query_scales, num_queries_before_expansion, num_cls)
+        obj_output_coords = obj_output_coords.reshape(num_dec_layers, bs, self.num_query_scales, num_queries_before_expansion, box_dim)
+        obj_query_feats = obj_query_feats.reshape(num_dec_layers, bs, self.num_query_scales, num_queries_before_expansion, C)
+        obj_past_trajs = obj_past_trajs.reshape(num_dec_layers, bs, self.num_query_scales, num_queries_before_expansion, past_steps, traj_dim)
+        obj_last_ref_pts = obj_last_ref_pts.reshape(bs, self.num_query_scales, num_queries_before_expansion, 3)
+
+        # Select best scale
+        scores = obj_output_classes.sigmoid().max(-1).values
+        best_scale_indices = scores.argmax(2, keepdim=True)
+        
+        # Gather from best scale
+        indices_for_classes = best_scale_indices.unsqueeze(-1).expand(-1, -1, -1, -1, num_cls)
+        best_obj_cls = torch.gather(obj_output_classes, 2, indices_for_classes).squeeze(2)
+        
+        indices_for_coords = best_scale_indices.unsqueeze(-1).expand(-1, -1, -1, -1, box_dim)
+        best_obj_coords = torch.gather(obj_output_coords, 2, indices_for_coords).squeeze(2)
+        
+        indices_for_feats = best_scale_indices.unsqueeze(-1).expand(-1, -1, -1, -1, C)
+        best_obj_feats = torch.gather(obj_query_feats, 2, indices_for_feats).squeeze(2)
+
+        indices_for_traj = best_scale_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, -1, past_steps, traj_dim)
+        best_obj_trajs = torch.gather(obj_past_trajs, 2, indices_for_traj).squeeze(2)
+        
+        best_scale_indices_ref_pts = best_scale_indices[-1].unsqueeze(-1).expand(-1, -1, -1, 3)
+        best_obj_ref_pts = torch.gather(obj_last_ref_pts, 1, best_scale_indices_ref_pts).squeeze(1)
+
+        # Combine with ego query outputs
+        det_output["all_cls_scores"] = torch.cat([best_obj_cls, ego_output_classes], dim=2)
+        det_output["all_bbox_preds"] = torch.cat([best_obj_coords, ego_output_coords], dim=2)
+        det_output["query_feats"] = torch.cat([best_obj_feats, ego_query_feats], dim=2)
+        det_output["all_past_traj_preds"] = torch.cat([best_obj_trajs, ego_past_trajs], dim=2)
+        det_output["last_ref_points"] = torch.cat([best_obj_ref_pts, ego_last_ref_pt], dim=1)
+
+        return det_output
 
     def extract_img_feat(self, img, len_queue=None):
         """Extract features of images."""
@@ -387,29 +495,56 @@ class UniV2XTrack(MVXTwoStageDetector):
         return bev_embed, bev_pos
 
     def _get_coop_bev_embed(self, bev_embed_src, bev_pos_src, track_instances, start_idx):
+        """
+        Improve fusion by using Gaussian splatting to project query features onto the BEV grid.
+        This provides a smoother and more principled way of fusing cooperative information.
+        """
         bev_embed = bev_embed_src
         bev_pos = bev_pos_src
-        act_track_instances = track_instances[start_idx:]  
+        act_track_instances = track_instances[start_idx:]
 
-        # print('act_track_instances len:',len(act_track_instances))
+        if len(act_track_instances) == 0:
+            return bev_embed, bev_pos
 
         locs = act_track_instances.ref_pts.sigmoid().clone()
-        locs[:, 0:1] = locs[:, 0:1] * self.bev_w # w
-        locs[:, 1:2] = locs[:, 1:2] * self.bev_h # h
+        locs[:, 0:1] = locs[:, 0:1] * self.bev_w  # w
+        locs[:, 1:2] = locs[:, 1:2] * self.bev_h  # h
 
-        pixel_len = 1 # 2
+        radius = 1  # Radius for Gaussian splatting
+        sigma = radius / 2.0
 
         for idx in range(act_track_instances.ref_pts.shape[0]):
-            w = int(locs[idx, 0])
-            h = int(locs[idx, 1])
-            if w >= self.bev_w or w < 0 or h >= self.bev_h or h < 0:
+            w_center, h_center = locs[idx, 0], locs[idx, 1]
+            if w_center >= self.bev_w or w_center < 0 or h_center >= self.bev_h or h_center < 0:
                 continue
 
-            for hh in range(max(0, h - pixel_len), min(self.bev_h - 1, h + pixel_len)):
-                for ww in range(max(0, w - pixel_len), min(self.bev_w - 1, w + pixel_len)):
-                    bev_embed[hh * self.bev_w + ww, :, :] =  bev_embed[hh * self.bev_w + ww, :, :] + self.bev_embed_linear(act_track_instances.query[idx, self.embed_dims:])
-                    bev_pos[:, :, hh, ww] = bev_pos[:, :, hh, ww] + self.bev_pos_linear(act_track_instances.query[idx, :self.embed_dims])
- 
+            w_min = max(0, int(w_center - radius))
+            w_max = min(self.bev_w, int(w_center + radius + 1))
+            h_min = max(0, int(h_center - radius))
+            h_max = min(self.bev_h, int(h_center + radius + 1))
+
+            if w_min >= w_max or h_min >= h_max:
+                continue
+
+            patch_w = torch.arange(w_min, w_max, device=locs.device)
+            patch_h = torch.arange(h_min, h_max, device=locs.device)
+            grid_h, grid_w = torch.meshgrid(patch_h, patch_w)
+
+            dist_sq = (grid_w.float() - w_center)**2 + (grid_h.float() - h_center)**2
+            gaussian_weights = torch.exp(-dist_sq / (2 * sigma**2))
+
+            # Update bev_embed
+            feature_embed = self.bev_embed_linear(act_track_instances.query[idx, self.embed_dims:])
+            indices = (grid_h * self.bev_w + grid_w).long().flatten()
+            
+            weighted_feature_embed = gaussian_weights.flatten().view(-1, 1, 1) * feature_embed.view(1, 1, -1)
+            bev_embed.index_add_(0, indices, weighted_feature_embed)
+
+            # Update bev_pos
+            feature_pos = self.bev_pos_linear(act_track_instances.query[idx, :self.embed_dims])
+            weighted_feature_pos = gaussian_weights.view(1, 1, *gaussian_weights.shape) * feature_pos.view(1, -1, 1, 1)
+            bev_pos[:, :, h_min:h_max, w_min:w_max] += weighted_feature_pos
+
         return bev_embed, bev_pos
           
     @auto_fp16(apply_to=("img", "prev_bev"))
@@ -448,6 +583,7 @@ class UniV2XTrack(MVXTwoStageDetector):
         )
 
         # agent fusion with query interaction
+        contrastive_loss_sum = torch.tensor(0.0).to(img.device)
         if self.is_ego_agent and self.is_cooperation and other_agent_results:
             # # load other-agent query offline
             # load_from_file = True
@@ -462,18 +598,23 @@ class UniV2XTrack(MVXTwoStageDetector):
                 ego2other_rt = other_agent_result['ego2other_rt']
                 other_agent_pc_range = other_agent_result['pc_range']
                 track_nums_src = len(track_instances)
-                track_instances = self.cross_agent_query_interaction(other_agent_track_instances, track_instances, ego2other_rt, other_agent_pc_range)
+                track_instances, contrastive_loss = self.cross_agent_query_interaction(other_agent_track_instances, track_instances, ego2other_rt, other_agent_pc_range)
+                contrastive_loss_sum += contrastive_loss
                 track_nums_new = len(track_instances)
                 add_nums = track_nums_new - track_nums_src
 
                 bev_embed,bev_pos = self._get_coop_bev_embed(bev_embed, bev_pos, track_instances, track_nums_new-add_nums)
+        
+        object_query_embeds, ref_points, num_queries_expanded, num_obj_queries = self._get_multiscale_queries(track_instances)
 
         det_output = self.pts_bbox_head.get_detections(
             bev_embed,
-            object_query_embeds=track_instances.query,
-            ref_points=track_instances.ref_pts,
+            object_query_embeds=object_query_embeds,
+            ref_points=ref_points,
             img_metas=img_metas,
         )
+
+        det_output = self._multiscale_query_fusion(det_output, num_queries_expanded, num_obj_queries)
 
         output_classes = det_output["all_cls_scores"]
         output_coords = det_output["all_bbox_preds"]
@@ -541,6 +682,7 @@ class UniV2XTrack(MVXTwoStageDetector):
         active_index = (track_instances.obj_idxes>=0) & (track_instances.iou >= self.gt_iou_threshold) & (track_instances.matched_gt_idxes >=0)
         out.update(self.select_active_track_query(track_instances, active_index, img_metas))
         out.update(self.select_sdc_track_query(track_instances[900], img_metas))
+        out['contrastive_loss'] = contrastive_loss_sum
         
         # memory bank 
         if self.memory_bank is not None:
@@ -569,142 +711,7 @@ class UniV2XTrack(MVXTwoStageDetector):
         out["sdc_embedding"] = sdc_instance.output_embedding[0]
         return out
 
-    @auto_fp16(apply_to=("img", "points"))
-    def forward_track_train(self,
-                            img,
-                            gt_bboxes_3d,
-                            gt_labels_3d,
-                            gt_past_traj,
-                            gt_past_traj_mask,
-                            gt_inds,
-                            gt_sdc_bbox,
-                            gt_sdc_label,
-                            l2g_t,
-                            l2g_r_mat,
-                            img_metas,
-                            timestamp,
-                            other_agent_results=None):
-        """Forward funciton
-        Args:
-        Returns:
-        """
-        track_instances = self._generate_empty_tracks()
-        num_frame = img.size(1)
-        # init gt instances!
-        gt_instances_list = []
-
-        for i in range(num_frame):
-            gt_instances = Instances((1, 1))
-            boxes = gt_bboxes_3d[0][i].tensor.to(img.device)
-            # normalize gt bboxes here!
-            boxes = normalize_bbox(boxes, self.pc_range)
-            sd_boxes = gt_sdc_bbox[0][i].tensor.to(img.device)
-            sd_boxes = normalize_bbox(sd_boxes, self.pc_range)
-            gt_instances.boxes = boxes
-            gt_instances.labels = gt_labels_3d[0][i]
-            gt_instances.obj_ids = gt_inds[0][i]
-            gt_instances.past_traj = gt_past_traj[0][i].float()
-            gt_instances.past_traj_mask = gt_past_traj_mask[0][i].float()
-            gt_instances.sdc_boxes = torch.cat([sd_boxes for _ in range(boxes.shape[0])], dim=0)  # boxes.shape[0] sometimes 0
-            gt_instances.sdc_labels = torch.cat([gt_sdc_label[0][i] for _ in range(gt_labels_3d[0][i].shape[0])], dim=0)
-            gt_instances_list.append(gt_instances)
-
-        self.criterion.initialize_for_single_clip(gt_instances_list)
-
-        out = dict()
-        out['univ2x_track_instances_list'] = []
-
-        for i in range(num_frame):
-            prev_img = img[:, :i, ...] if i != 0 else img[:, :1, ...]
-            prev_img_metas = copy.deepcopy(img_metas)
-            # TODO: Generate prev_bev in an RNN way.
-
-            img_single = torch.stack([img_[i] for img_ in img], dim=0)
-            img_metas_single = [copy.deepcopy(img_metas[0][i])]
-            if i == num_frame - 1:
-                l2g_r2 = None
-                l2g_t2 = None
-                time_delta = None
-            else:
-                l2g_r2 = l2g_r_mat[0][i + 1]
-                l2g_t2 = l2g_t[0][i + 1]
-                time_delta = timestamp[0][i + 1] - timestamp[0][i]
-            all_query_embeddings = []
-            all_matched_idxes = []
-            all_instances_pred_logits = []
-            all_instances_pred_boxes = []
-            frame_res = self._forward_single_frame_train(
-                img_single,
-                img_metas_single,
-                track_instances,
-                prev_img,
-                prev_img_metas,
-                l2g_r_mat[0][i],
-                l2g_t[0][i],
-                l2g_r2,
-                l2g_t2,
-                time_delta,
-                all_query_embeddings,
-                all_matched_idxes,
-                all_instances_pred_logits,
-                all_instances_pred_boxes,
-                # other_agent_results=other_agent_results if i == num_frame - 1 else None
-                other_agent_results=other_agent_results,
-                univ2x_frame_id=i
-            )
-            # all_query_embeddings: len=dec nums, N*256
-            # all_matched_idxes: len=dec nums, N*2
-            track_instances = frame_res["track_instances"]
-
-            # used for ego-agent fusion
-            if not self.is_ego_agent and self.return_track_query:
-                out['univ2x_track_instances_list'].append(track_instances)
-
-        get_keys = ["bev_embed", "bev_pos",
-                    "track_query_embeddings", "track_query_matched_idxes", "track_bbox_results",
-                    "sdc_boxes_3d", "sdc_scores_3d", "sdc_track_scores", "sdc_track_bbox_results", "sdc_embedding"]
-        out.update({k: frame_res[k] for k in get_keys})
-        
-        losses = self.criterion.losses_dict
-        return losses, out
-
-    def upsample_bev_if_tiny(self, outs_track):
-        if outs_track["bev_embed"].size(0) == 100 * 100:
-            # For tiny model
-            # bev_emb
-            bev_embed = outs_track["bev_embed"] # [10000, 1, 256]
-            dim, _, _ = bev_embed.size()
-            w = h = int(math.sqrt(dim))
-            assert h == w == 100
-
-            bev_embed = rearrange(bev_embed, '(h w) b c -> b c h w', h=h, w=w)  # [1, 256, 100, 100]
-            bev_embed = nn.Upsample(scale_factor=2)(bev_embed)  # [1, 256, 200, 200]
-            bev_embed = rearrange(bev_embed, 'b c h w -> (h w) b c')
-            outs_track["bev_embed"] = bev_embed
-
-            # prev_bev
-            prev_bev = outs_track.get("prev_bev", None)
-            if prev_bev is not None:
-                if self.training:
-                    #  [1, 10000, 256]
-                    prev_bev = rearrange(prev_bev, 'b (h w) c -> b c h w', h=h, w=w)
-                    prev_bev = nn.Upsample(scale_factor=2)(prev_bev)  # [1, 256, 200, 200]
-                    prev_bev = rearrange(prev_bev, 'b c h w -> b (h w) c')
-                    outs_track["prev_bev"] = prev_bev
-                else:
-                    #  [10000, 1, 256]
-                    prev_bev = rearrange(prev_bev, '(h w) b c -> b c h w', h=h, w=w)
-                    prev_bev = nn.Upsample(scale_factor=2)(prev_bev)  # [1, 256, 200, 200]
-                    prev_bev = rearrange(prev_bev, 'b c h w -> (h w) b c')
-                    outs_track["prev_bev"] = prev_bev
-
-            # bev_pos
-            bev_pos  = outs_track["bev_pos"]  # [1, 256, 100, 100]
-            bev_pos = nn.Upsample(scale_factor=2)(bev_pos)  # [1, 256, 200, 200]
-            outs_track["bev_pos"] = bev_pos
-        return outs_track
-
-
+    @auto_fp16(apply_to=("img", "prev_bev"))
     def _forward_single_frame_inference(
         self,
         img,
@@ -763,12 +770,17 @@ class UniV2XTrack(MVXTwoStageDetector):
 
                 bev_embed,bev_pos = self._get_coop_bev_embed(bev_embed, bev_pos, track_instances, track_nums_new-add_nums)
 
+        object_query_embeds, ref_points, num_queries_expanded, num_obj_queries = self._get_multiscale_queries(track_instances)
+
         det_output = self.pts_bbox_head.get_detections(
             bev_embed, 
-            object_query_embeds=track_instances.query,
-            ref_points=track_instances.ref_pts,
+            object_query_embeds=object_query_embeds,
+            ref_points=ref_points,
             img_metas=img_metas,
         )
+
+        det_output = self._multiscale_query_fusion(det_output, num_queries_expanded, num_obj_queries)
+
         output_classes = det_output["all_cls_scores"]
         output_coords = det_output["all_bbox_preds"]
         last_ref_pts = det_output["last_ref_points"]
@@ -971,4 +983,143 @@ class UniV2XTrack(MVXTwoStageDetector):
             result_dict = None
 
         return [result_dict]
+
+    @auto_fp16(apply_to=("img", "points"))
+    def forward_track_train(self,
+                            img,
+                            gt_bboxes_3d,
+                            gt_labels_3d,
+                            gt_past_traj,
+                            gt_past_traj_mask,
+                            gt_inds,
+                            gt_sdc_bbox,
+                            gt_sdc_label,
+                            l2g_t,
+                            l2g_r_mat,
+                            img_metas,
+                            timestamp,
+                            other_agent_results=None):
+        """Forward funciton
+        Args:
+        Returns:
+        """
+        track_instances = self._generate_empty_tracks()
+        num_frame = img.size(1)
+        # init gt instances!
+        gt_instances_list = []
+
+        for i in range(num_frame):
+            gt_instances = Instances((1, 1))
+            boxes = gt_bboxes_3d[0][i].tensor.to(img.device)
+            # normalize gt bboxes here!
+            boxes = normalize_bbox(boxes, self.pc_range)
+            sd_boxes = gt_sdc_bbox[0][i].tensor.to(img.device)
+            sd_boxes = normalize_bbox(sd_boxes, self.pc_range)
+            gt_instances.boxes = boxes
+            gt_instances.labels = gt_labels_3d[0][i]
+            gt_instances.obj_ids = gt_inds[0][i]
+            gt_instances.past_traj = gt_past_traj[0][i].float()
+            gt_instances.past_traj_mask = gt_past_traj_mask[0][i].float()
+            gt_instances.sdc_boxes = torch.cat([sd_boxes for _ in range(boxes.shape[0])], dim=0)  # boxes.shape[0] sometimes 0
+            gt_instances.sdc_labels = torch.cat([gt_sdc_label[0][i] for _ in range(gt_labels_3d[0][i].shape[0])], dim=0)
+            gt_instances_list.append(gt_instances)
+
+        self.criterion.initialize_for_single_clip(gt_instances_list)
+
+        out = dict()
+        out['univ2x_track_instances_list'] = []
+        all_contrastive_losses = []
+
+        for i in range(num_frame):
+            prev_img = img[:, :i, ...] if i != 0 else img[:, :1, ...]
+            prev_img_metas = copy.deepcopy(img_metas)
+            # TODO: Generate prev_bev in an RNN way.
+
+            img_single = torch.stack([img_[i] for img_ in img], dim=0)
+            img_metas_single = [copy.deepcopy(img_metas[0][i])]
+            if i == num_frame - 1:
+                l2g_r2 = None
+                l2g_t2 = None
+                time_delta = None
+            else:
+                l2g_r2 = l2g_r_mat[0][i + 1]
+                l2g_t2 = l2g_t[0][i + 1]
+                time_delta = timestamp[0][i + 1] - timestamp[0][i]
+            all_query_embeddings = []
+            all_matched_idxes = []
+            all_instances_pred_logits = []
+            all_instances_pred_boxes = []
+            frame_res = self._forward_single_frame_train(
+                img_single,
+                img_metas_single,
+                track_instances,
+                prev_img,
+                prev_img_metas,
+                l2g_r_mat[0][i],
+                l2g_t[0][i],
+                l2g_r2,
+                l2g_t2,
+                time_delta,
+                all_query_embeddings,
+                all_matched_idxes,
+                all_instances_pred_logits,
+                all_instances_pred_boxes,
+                # other_agent_results=other_agent_results if i == num_frame - 1 else None
+                other_agent_results=other_agent_results,
+                univ2x_frame_id=i
+            )
+            # all_query_embeddings: len=dec nums, N*256
+            # all_matched_idxes: len=dec nums, N*2
+            track_instances = frame_res["track_instances"]
+            all_contrastive_losses.append(frame_res.get('contrastive_loss', torch.tensor(0.0).to(img.device)))
+
+            # used for ego-agent fusion
+            if not self.is_ego_agent and self.return_track_query:
+                out['univ2x_track_instances_list'].append(track_instances)
+
+        get_keys = ["bev_embed", "bev_pos",
+                    "track_query_embeddings", "track_query_matched_idxes", "track_bbox_results",
+                    "sdc_boxes_3d", "sdc_scores_3d", "sdc_track_scores", "sdc_track_bbox_results", "sdc_embedding"]
+        out.update({k: frame_res[k] for k in get_keys})
+        
+        losses = self.criterion.losses_dict
+        if self.is_cooperation:
+            losses['loss_contrastive'] = torch.mean(torch.stack(all_contrastive_losses))
+        return losses, out
+
+    def upsample_bev_if_tiny(self, outs_track):
+        if outs_track["bev_embed"].size(0) == 100 * 100:
+            # For tiny model
+            # bev_emb
+            bev_embed = outs_track["bev_embed"] # [10000, 1, 256]
+            dim, _, _ = bev_embed.size()
+            w = h = int(math.sqrt(dim))
+            assert h == w == 100
+
+            bev_embed = rearrange(bev_embed, '(h w) b c -> b c h w', h=h, w=w)  # [1, 256, 100, 100]
+            bev_embed = nn.Upsample(scale_factor=2)(bev_embed)  # [1, 256, 200, 200]
+            bev_embed = rearrange(bev_embed, 'b c h w -> (h w) b c')
+            outs_track["bev_embed"] = bev_embed
+
+            # prev_bev
+            prev_bev = outs_track.get("prev_bev", None)
+            if prev_bev is not None:
+                if self.training:
+                    #  [1, 10000, 256]
+                    prev_bev = rearrange(prev_bev, 'b (h w) c -> b c h w', h=h, w=w)
+                    prev_bev = nn.Upsample(scale_factor=2)(prev_bev)  # [1, 256, 200, 200]
+                    prev_bev = rearrange(prev_bev, 'b c h w -> b (h w) c')
+                    outs_track["prev_bev"] = prev_bev
+                else:
+                    #  [10000, 1, 256]
+                    prev_bev = rearrange(prev_bev, '(h w) b c -> b c h w', h=h, w=w)
+                    prev_bev = nn.Upsample(scale_factor=2)(prev_bev)  # [1, 256, 200, 200]
+                    prev_bev = rearrange(prev_bev, 'b c h w -> (h w) b c')
+                    outs_track["prev_bev"] = prev_bev
+
+            # bev_pos
+            bev_pos  = outs_track["bev_pos"]  # [1, 256, 100, 100]
+            bev_pos = nn.Upsample(scale_factor=2)(bev_pos)  # [1, 256, 200, 200]
+            outs_track["bev_pos"] = bev_pos
+        return outs_track
 

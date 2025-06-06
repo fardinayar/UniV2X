@@ -14,7 +14,7 @@ from ..dense_heads.track_head_plugin import Instances
 
 class AgentQueryFusion(nn.Module):
 
-    def __init__(self, pc_range, embed_dims=256, fusion_mode='attention', 
+    def __init__(self, pc_range, embed_dims=256, fusion_mode='addition', 
                  num_attention_heads=8, attention_dropout=0.1, feedforward_dim=None):
         super(AgentQueryFusion, self).__init__()
 
@@ -52,6 +52,14 @@ class AgentQueryFusion(nn.Module):
             
             self.inf_type_embed = nn.Parameter(torch.randn(1, 1, self.embed_dims))
             self.veh_type_embed = nn.Parameter(torch.randn(1, 1, self.embed_dims))
+
+        # Contrastive loss components
+        self.projection_head = nn.Sequential(
+            nn.Linear(self.embed_dims, self.embed_dims),
+            nn.ReLU(),
+            nn.Linear(self.embed_dims, self.embed_dims // 2)
+        )
+        self.temperature = nn.Parameter(torch.ones([]) * 0.07)
 
         # parameter initialization
         for p in self.parameters():
@@ -91,6 +99,33 @@ class AgentQueryFusion(nn.Module):
         diff = torch.abs(veh_pts - inf_pts) / veh_dims
         return diff[0] <= 1 and diff[1] <= 1 and diff[2] <= 1
     
+    def _calculate_contrastive_loss(self, veh_queries, inf_queries):
+        # veh_queries: [N, D], inf_queries: [N, D]
+        # N is the number of matched pairs.
+        
+        # Project features into the contrastive space
+        proj_veh_queries = self.projection_head(veh_queries)
+        proj_inf_queries = self.projection_head(inf_queries)
+
+        # L2-normalize features
+        proj_veh_queries = F.normalize(proj_veh_queries, p=2, dim=-1)
+        proj_inf_queries = F.normalize(proj_inf_queries, p=2, dim=-1)
+
+        # Calculate cosine similarity. The diagonal represents positive pairs.
+        # Off-diagonal elements are in-batch negative pairs.
+        logits = torch.matmul(proj_veh_queries, proj_inf_queries.T) / self.temperature.exp()
+        
+        # Symmetric loss
+        batch_size = logits.shape[0]
+        if batch_size == 0:
+            return torch.tensor(0.0).to(logits.device)
+            
+        labels = torch.arange(batch_size, device=logits.device)
+        loss_veh_to_inf = F.cross_entropy(logits, labels)
+        loss_inf_to_veh = F.cross_entropy(logits.T, labels)
+        
+        return (loss_veh_to_inf + loss_inf_to_veh) / 2.0
+
     def _query_matching(self, inf_ref_pts, veh_ref_pts, veh_mask, veh_pred_dims):
         """
         inf_ref_pts: [..., 3] (xyz)
@@ -153,14 +188,31 @@ class AgentQueryFusion(nn.Module):
         veh_accept_idx = []
         inf_accept_idx = []
 
+        # Collect matched queries before modifying them
+        pre_fusion_veh_queries = []
+        pre_fusion_inf_queries = []
+
         for i in range(len(veh_idx)):
             if cost_matrix[veh_idx[i]][inf_idx[i]] < 1e5:
-                veh_accept_idx.append(veh_idx[i])
-                inf_accept_idx.append(inf_idx[i])
+                v_i = veh_idx[i]
+                i_i = inf_idx[i]
+                veh_accept_idx.append(v_i)
+                inf_accept_idx.append(i_i)
+                
+                # Store pre-fusion queries for contrastive loss
+                pre_fusion_veh_queries.append(veh.query[v_i, self.embed_dims:])
+                pre_fusion_inf_queries.append(inf.query[i_i, self.embed_dims:])
                 
                 if self.fusion_mode == 'addition':
                     # Original simple addition-based fusion
-                    veh.query[veh_idx[i], self.embed_dims:] = veh.query[veh_idx[i], self.embed_dims:] + self.cross_agent_fusion(inf.query[inf_idx[i], self.embed_dims:])
+                    veh.query[v_i, self.embed_dims:] = veh.query[v_i, self.embed_dims:] + self.cross_agent_fusion(inf.query[i_i, self.embed_dims:])
+        
+        contrastive_loss = torch.tensor(0.0, device=veh.query.device)
+        if len(pre_fusion_veh_queries) > 0:
+            contrastive_loss = self._calculate_contrastive_loss(
+                torch.stack(pre_fusion_veh_queries),
+                torch.stack(pre_fusion_inf_queries)
+            )
         
         if self.fusion_mode == 'attention':
             # Attention-based fusion
@@ -181,7 +233,7 @@ class AgentQueryFusion(nn.Module):
                 veh.query[:, self.embed_dims:] + fused_feat.squeeze(0)
             ], dim=1)
 
-        return veh, veh_accept_idx, inf_accept_idx
+        return veh, veh_accept_idx, inf_accept_idx, contrastive_loss
     
 
     def _query_complementation(self, inf, veh, inf_accept_idx):
@@ -211,7 +263,7 @@ class AgentQueryFusion(nn.Module):
         inf_mask = torch.where(inf.obj_idxes>=0)
         inf = inf[inf_mask]
         if len(inf) == 0:
-            return veh
+            return veh, torch.tensor(0.0).to(veh.query.device)
         inf_mask_new = torch.where(inf.obj_idxes>=0)
         
         #not care obj_idxes of inf
@@ -263,9 +315,9 @@ class AgentQueryFusion(nn.Module):
         inf.query[..., self.embed_dims:] = self.cross_agent_align(torch.cat([inf.query[..., self.embed_dims:],inf2veh_r], -1))
 
         # cross-agent query fusion (supports both addition and attention modes)
-        veh, veh_accept_idx, inf_accept_idx = self._query_fusion(inf, veh, inf_idx, veh_idx, cost_matrix)
+        veh, veh_accept_idx, inf_accept_idx, contrastive_loss = self._query_fusion(inf, veh, inf_idx, veh_idx, cost_matrix)
 
         # cross-agent query complementation
         veh = self._query_complementation(inf, veh, inf_accept_idx)
 
-        return veh
+        return veh, contrastive_loss
