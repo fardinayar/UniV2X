@@ -156,3 +156,5 @@ param_counts/
 a.zip
 */__pycache__/*
 projects/mmdet3d_plugin/datasets/data_utils/__pycache__/data_utils.cpython-38.pyc
+
+output_visualize/

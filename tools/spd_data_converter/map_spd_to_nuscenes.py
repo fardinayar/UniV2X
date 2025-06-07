@@ -45,81 +45,105 @@ def map_spd_to_nuscenes_lane(spd_map_data, nuscenes_map_data):
     nuscenes_polygon_infos = []
     nuscenes_lane_infos = []
 
-    for lane_id, lane in  tqdm(spd_map_data['LANE'].items()):
-        nodes_token_mappings = {}
-        token_node_mappings = {}
+    # Skip if no LANE data available
+    if 'LANE' not in spd_map_data:
+        return nuscenes_map_data
 
-        lane_boundary = []
-        for pt in lane['left_boundary']:
-            xy = []
-            pt_split = pt.split(', ')
-            xy.append(float(pt_split[0][1:]))
-            xy.append(float(pt_split[1][:-1]))
-            lane_boundary.append(xy)
-        
-        for pt in lane['right_boundary'][::-1]:
-            xy = []
-            pt_split = pt.split(', ')
-            xy.append(float(pt_split[0][1:]))
-            xy.append(float(pt_split[1][:-1]))
-            lane_boundary.append(xy)
+    for lane_id, lane in tqdm(spd_map_data['LANE'].items()):
+        try:
+            # Skip if required fields are missing
+            if 'left_boundary' not in lane or 'right_boundary' not in lane or 'lane_type' not in lane:
+                continue
+                
+            # Skip if lane type is not in mappings
+            if lane['lane_type'] not in lane_type_mappings:
+                continue
 
-        polygon_nodes = np.around(np.array(lane_boundary), 2)
+            nodes_token_mappings = {}
+            token_node_mappings = {}
 
-        for ii in range(polygon_nodes.shape[0]):
-            x, y = polygon_nodes[ii, 0], polygon_nodes[ii, 1]
-            node_token = gen_token('node', str(x), str(y))
-            node_info = {
-                'token': node_token,
-                'x': x,
-                'y': y
+            lane_boundary = []
+            try:
+                for pt in lane['left_boundary']:
+                    xy = []
+                    pt_split = pt.split(', ')
+                    xy.append(float(pt_split[0][1:]))
+                    xy.append(float(pt_split[1][:-1]))
+                    lane_boundary.append(xy)
+                
+                for pt in lane['right_boundary'][::-1]:
+                    xy = []
+                    pt_split = pt.split(', ')
+                    xy.append(float(pt_split[0][1:]))
+                    xy.append(float(pt_split[1][:-1]))
+                    lane_boundary.append(xy)
+            except (ValueError, IndexError):
+                # Skip if boundary points are malformed
+                continue
+
+            # Skip if not enough points to form a polygon
+            if len(lane_boundary) < 3:
+                continue
+
+            polygon_nodes = np.around(np.array(lane_boundary), 2)
+
+            for ii in range(polygon_nodes.shape[0]):
+                x, y = polygon_nodes[ii, 0], polygon_nodes[ii, 1]
+                node_token = gen_token('node', str(x), str(y))
+                node_info = {
+                    'token': node_token,
+                    'x': x,
+                    'y': y
+                }
+                nuscenes_node_infos.append(node_info)
+
+                nodes_token_mappings[(lane_id, x, y)] = node_token
+                token_node_mappings[node_token] = (lane_id, x, y)
+
+            polygon_token = gen_token(lane_id, 'polygon')
+            polygon_info = {
+                'token': polygon_token,
+                'exterior_node_tokens': [key for key in token_node_mappings.keys()],
+                'holes': []
             }
-            nuscenes_node_infos.append(node_info)
+            nuscenes_polygon_infos.append(polygon_info)
 
-            nodes_token_mappings[(lane_id, x, y)] = node_token
-            token_node_mappings[node_token] = (lane_id, x, y)
+            x1, y1 = polygon_nodes[0, 0], polygon_nodes[0, 1]
+            x2, y2 = polygon_nodes[1, 0], polygon_nodes[1, 1]
+            line_token = gen_token(lane_id, str(x1), str(y1), str(x2), str(y2))
+            line_info = {
+                'token': line_token,
+                'node_tokens': [nodes_token_mappings[(lane_id, x1, y1)],
+                                                nodes_token_mappings[(lane_id, x2, y2)]]
+            }
+            nuscenes_line_infos.append(line_info)
+            from_edge_line_token = line_token
 
-        polygon_token = gen_token(lane_id, 'polygon')
-        polygon_info = {
-            'token': polygon_token,
-            'exterior_node_tokens': [key for key in token_node_mappings.keys()],
-            'holes': []
-        }
-        nuscenes_polygon_infos.append(polygon_info)
+            x1, y1 = polygon_nodes[-1, 0], polygon_nodes[-1, 1]
+            x2, y2 = polygon_nodes[0, 0], polygon_nodes[0, 1]
+            line_token = gen_token(lane_id, str(x1), str(y1), str(x2), str(y2))
+            line_info = {
+                'token': line_token,
+                'node_tokens': [nodes_token_mappings[(lane_id, x1, y1)],
+                                                nodes_token_mappings[(lane_id, x2, y2)]]
+            }
+            nuscenes_line_infos.append(line_info)
+            to_edge_line_token = line_token
 
-        x1, y1 = polygon_nodes[0, 0], polygon_nodes[0, 1]
-        x2, y2 = polygon_nodes[1, 0], polygon_nodes[1, 1]
-        line_token = gen_token(lane_id, str(x1), str(y1), str(x2), str(y2))
-        line_info = {
-            'token': line_token,
-            'node_tokens': [nodes_token_mappings[(lane_id, x1, y1)],
-                                            nodes_token_mappings[(lane_id, x2, y2)]]
-        }
-        nuscenes_line_infos.append(line_info)
-        from_edge_line_token = line_token
-
-        x1, y1 = polygon_nodes[-1, 0], polygon_nodes[-1, 1]
-        x2, y2 = polygon_nodes[0, 0], polygon_nodes[0, 1]
-        line_token = gen_token(lane_id, str(x1), str(y1), str(x2), str(y2))
-        line_info = {
-            'token': line_token,
-            'node_tokens': [nodes_token_mappings[(lane_id, x1, y1)],
-                                            nodes_token_mappings[(lane_id, x2, y2)]]
-        }
-        nuscenes_line_infos.append(line_info)
-        to_edge_line_token = line_token
-
-        lane_token = gen_token(lane_id, 'lane') # (lane_id, 'lane')
-        lane_info = {
-            'token': lane_token,
-            'polygon_token': polygon_token,
-            'lane_type': lane_type_mappings[lane['lane_type']],
-            'from_edge_line_token': from_edge_line_token,
-            'to_edge_line_token': to_edge_line_token,
-            'left_lane_divider_segments': [],
-            'right_lane_divider_segments': []
-        }
-        nuscenes_lane_infos.append(lane_info)
+            lane_token = gen_token(lane_id, 'lane')
+            lane_info = {
+                'token': lane_token,
+                'polygon_token': polygon_token,
+                'lane_type': lane_type_mappings[lane['lane_type']],
+                'from_edge_line_token': from_edge_line_token,
+                'to_edge_line_token': to_edge_line_token,
+                'left_lane_divider_segments': [],
+                'right_lane_divider_segments': []
+            }
+            nuscenes_lane_infos.append(lane_info)
+        except (KeyError, ValueError, TypeError, IndexError) as e:
+            # Skip lanes that have any issues
+            continue
 
     nuscenes_map_data['node'] += nuscenes_node_infos
     nuscenes_map_data['line'] += nuscenes_line_infos
@@ -135,49 +159,70 @@ def map_spd_to_nuscenes_road_segment(spd_map_data, nuscenes_map_data):
     nuscenes_polygon_infos = []
     nuscenes_road_segment_infos = []
 
-    for segment_id, segment in  tqdm(spd_map_data['JUNCTION'].items()):
-        nodes_token_mappings = {}
-        token_node_mappings = {}
+    # Skip if no JUNCTION data available
+    if 'JUNCTION' not in spd_map_data:
+        return nuscenes_map_data
 
-        polygon_nodes = []
-        for pt in segment['polygon']:
-            xy = []
-            pt_split = pt.split(', ')
-            xy.append(float(pt_split[0][1:]))
-            xy.append(float(pt_split[1][:-1]))
-            polygon_nodes.append(xy)
-        polygon_nodes = np.array(polygon_nodes) # [first_point, ..., end_point], different from nodes generated from centerline_to_polygon
-        polygon_nodes = np.around(polygon_nodes, 2)
+    for segment_id, segment in tqdm(spd_map_data['JUNCTION'].items()):
+        try:
+            # Skip if required fields are missing
+            if 'polygon' not in segment:
+                continue
 
-        for ii in range(polygon_nodes.shape[0]): # first point is not end point
-            x, y = polygon_nodes[ii, 0], polygon_nodes[ii, 1]
-            node_token = gen_token('node', str(x), str(y))
-            node_info = {
-                'token': node_token,
-                'x': x,
-                'y': y
+            nodes_token_mappings = {}
+            token_node_mappings = {}
+
+            polygon_nodes = []
+            try:
+                for pt in segment['polygon']:
+                    xy = []
+                    pt_split = pt.split(', ')
+                    xy.append(float(pt_split[0][1:]))
+                    xy.append(float(pt_split[1][:-1]))
+                    polygon_nodes.append(xy)
+            except (ValueError, IndexError):
+                # Skip if polygon points are malformed
+                continue
+
+            # Skip if not enough points to form a polygon
+            if len(polygon_nodes) < 3:
+                continue
+
+            polygon_nodes = np.array(polygon_nodes)
+            polygon_nodes = np.around(polygon_nodes, 2)
+
+            for ii in range(polygon_nodes.shape[0]):
+                x, y = polygon_nodes[ii, 0], polygon_nodes[ii, 1]
+                node_token = gen_token('node', str(x), str(y))
+                node_info = {
+                    'token': node_token,
+                    'x': x,
+                    'y': y
+                }
+                nuscenes_node_infos.append(node_info)
+
+                nodes_token_mappings[(segment_id, x, y)] = node_token
+                token_node_mappings[node_token] = (segment_id, x, y)
+
+            polygon_token = gen_token(segment_id, 'road_segment', 'polygon')
+            polygon_info = {
+                'token': polygon_token,
+                'exterior_node_tokens': [key for key in token_node_mappings.keys()],
+                'holes': []
             }
-            nuscenes_node_infos.append(node_info)
+            nuscenes_polygon_infos.append(polygon_info)
 
-            nodes_token_mappings[(segment_id, x, y)] = node_token
-            token_node_mappings[node_token] = (segment_id, x, y)
-
-        polygon_token = gen_token(segment_id, 'road_segment', 'polygon')
-        polygon_info = {
-            'token': polygon_token,
-            'exterior_node_tokens': [key for key in token_node_mappings.keys()],
-            'holes': []
-        }
-        nuscenes_polygon_infos.append(polygon_info)
-
-        segment_token = gen_token(segment_id, 'road_segment')
-        segment_info = {
-            'token': segment_token,
-            'polygon_token': polygon_token,
-            'is_intersection': bool(1),
-            'drivable_area_token': ''
-        }
-        nuscenes_road_segment_infos.append(segment_info)
+            segment_token = gen_token(segment_id, 'road_segment')
+            segment_info = {
+                'token': segment_token,
+                'polygon_token': polygon_token,
+                'is_intersection': bool(1),
+                'drivable_area_token': ''
+            }
+            nuscenes_road_segment_infos.append(segment_info)
+        except (KeyError, ValueError, TypeError, IndexError) as e:
+            # Skip segments that have any issues
+            continue
 
     nuscenes_map_data['node'] += nuscenes_node_infos
     nuscenes_map_data['line'] += nuscenes_line_infos
@@ -193,48 +238,69 @@ def map_spd_to_nuscenes_ped_crossing(spd_map_data, nuscenes_map_data):
     nuscenes_polygon_infos = []
     nuscenes_ped_crossing_infos = []
 
-    for segment_id, ped_crossing in  tqdm(spd_map_data['CROSSWALK'].items()):
-        nodes_token_mappings = {}
-        token_node_mappings = {}
+    # Skip if no CROSSWALK data available
+    if 'CROSSWALK' not in spd_map_data:
+        return nuscenes_map_data
 
-        polygon_nodes = []
-        for pt in ped_crossing['polygon']:
-            xy = []
-            pt_split = pt.split(', ')
-            xy.append(float(pt_split[0][1:]))
-            xy.append(float(pt_split[1][:-1]))
-            polygon_nodes.append(xy)
-        polygon_nodes = np.array(polygon_nodes) # [first_point, ..., end_point], different from nodes generated from centerline_to_polygon
-        polygon_nodes = np.around(polygon_nodes, 2)
+    for segment_id, ped_crossing in tqdm(spd_map_data['CROSSWALK'].items()):
+        try:
+            # Skip if required fields are missing
+            if 'polygon' not in ped_crossing:
+                continue
 
-        for ii in range(polygon_nodes.shape[0]): # first point is not end point
-            x, y = polygon_nodes[ii, 0], polygon_nodes[ii, 1]
-            node_token = gen_token('node', str(x), str(y))
-            node_info = {
-                'token': node_token,
-                'x': x,
-                'y': y
+            nodes_token_mappings = {}
+            token_node_mappings = {}
+
+            polygon_nodes = []
+            try:
+                for pt in ped_crossing['polygon']:
+                    xy = []
+                    pt_split = pt.split(', ')
+                    xy.append(float(pt_split[0][1:]))
+                    xy.append(float(pt_split[1][:-1]))
+                    polygon_nodes.append(xy)
+            except (ValueError, IndexError):
+                # Skip if polygon points are malformed
+                continue
+
+            # Skip if not enough points to form a polygon
+            if len(polygon_nodes) < 3:
+                continue
+
+            polygon_nodes = np.array(polygon_nodes)
+            polygon_nodes = np.around(polygon_nodes, 2)
+
+            for ii in range(polygon_nodes.shape[0]):
+                x, y = polygon_nodes[ii, 0], polygon_nodes[ii, 1]
+                node_token = gen_token('node', str(x), str(y))
+                node_info = {
+                    'token': node_token,
+                    'x': x,
+                    'y': y
+                }
+                nuscenes_node_infos.append(node_info)
+
+                nodes_token_mappings[(segment_id, x, y)] = node_token
+                token_node_mappings[node_token] = (segment_id, x, y)
+
+            polygon_token = gen_token(segment_id, 'ped_crossing', 'polygon')
+            polygon_info = {
+                'token': polygon_token,
+                'exterior_node_tokens': [key for key in token_node_mappings.keys()],
+                'holes': []
             }
-            nuscenes_node_infos.append(node_info)
+            nuscenes_polygon_infos.append(polygon_info)
 
-            nodes_token_mappings[(segment_id, x, y)] = node_token
-            token_node_mappings[node_token] = (segment_id, x, y)
-
-        polygon_token = gen_token(segment_id, 'ped_crossing', 'polygon')
-        polygon_info = {
-            'token': polygon_token,
-            'exterior_node_tokens': [key for key in token_node_mappings.keys()],
-            'holes': []
-        }
-        nuscenes_polygon_infos.append(polygon_info)
-
-        segment_token = gen_token(segment_id, 'ped_crossing') # (segment_id, 'road_segment')
-        crossing_info = {
-            'token': segment_token,
-            'polygon_token': polygon_token,
-            'road_segment_token': ''
-        }
-        nuscenes_ped_crossing_infos.append(crossing_info)
+            segment_token = gen_token(segment_id, 'ped_crossing')
+            crossing_info = {
+                'token': segment_token,
+                'polygon_token': polygon_token,
+                'road_segment_token': ''
+            }
+            nuscenes_ped_crossing_infos.append(crossing_info)
+        except (KeyError, ValueError, TypeError, IndexError) as e:
+            # Skip crossings that have any issues
+            continue
 
     nuscenes_map_data['node'] += nuscenes_node_infos
     nuscenes_map_data['line'] += nuscenes_line_infos
@@ -297,18 +363,32 @@ def map_spd_to_nuscenes_canvas_edge(nuscenes_map_data):
 
 def map_spd_to_nuscenes(maps_root, save_root):
     nuscenes_map_keys = ['version', 'polygon', 'line', 'node', 
-                                                'drivable_area', 'road_segment', 'road_block', 
-                                                'lane', 'ped_crossing', 'walkway', 'stop_line', 
-                                                'carpark_area', 'road_divider', 'lane_divider', 
-                                                'traffic_light', 'canvas_edge', 'connectivity', 
-                                                'arcline_path_3', 'lane_connector']
+                         'drivable_area', 'road_segment', 'road_block', 
+                         'lane', 'ped_crossing', 'walkway', 'stop_line', 
+                         'carpark_area', 'road_divider', 'lane_divider', 
+                         'traffic_light', 'canvas_edge', 'connectivity', 
+                         'arcline_path_3', 'lane_connector']
     
     ## Step 0: load maps and initialize nuscenes data
+    # Check if maps_root exists
+    if not os.path.exists(maps_root):
+        print(f"Warning: Maps root directory {maps_root} does not exist")
+        return
+
     location_names = []
-    map_json_paths = os.listdir(maps_root)
-    for map_path in map_json_paths:
-        location_name = map_path.replace('.json', '')
-        location_names.append(location_name)
+    try:
+        map_json_paths = os.listdir(maps_root)
+        for map_path in map_json_paths:
+            if map_path.endswith('.json'):
+                location_name = map_path.replace('.json', '')
+                location_names.append(location_name)
+    except Exception as e:
+        print(f"Error listing map files: {e}")
+        return
+
+    if not location_names:
+        print("Warning: No valid map files found")
+        return
     
     nuscenes_map_datas = {}
     for location_name in location_names:
@@ -321,47 +401,65 @@ def map_spd_to_nuscenes(maps_root, save_root):
 
     for location_name in location_names:
         print("Location is: ", location_name)
-        spd_map_data = load_json(os.path.join(maps_root, location_name+'.json'))
+        try:
+            spd_map_data = load_json(os.path.join(maps_root, location_name+'.json'))
+        except Exception as e:
+            print(f"Error loading map file for {location_name}: {e}")
+            continue
+
+        if not spd_map_data:
+            print(f"Warning: Empty or invalid map file for {location_name}")
+            continue
+
         nuscenes_map_data = nuscenes_map_datas[location_name]
 
-        ## Step 1: generate lane elements
-        nuscenes_map_data = map_spd_to_nuscenes_lane(spd_map_data, nuscenes_map_data)
+        try:
+            ## Step 1: generate lane elements
+            nuscenes_map_data = map_spd_to_nuscenes_lane(spd_map_data, nuscenes_map_data)
 
-        ## Step 2: generate road_segment elements
-        nuscenes_map_data = map_spd_to_nuscenes_road_segment(spd_map_data, nuscenes_map_data)
+            ## Step 2: generate road_segment elements
+            nuscenes_map_data = map_spd_to_nuscenes_road_segment(spd_map_data, nuscenes_map_data)
 
-        ## Step 3: generate ped_crossing elements
-        nuscenes_map_data = map_spd_to_nuscenes_ped_crossing(spd_map_data, nuscenes_map_data)
+            ## Step 3: generate ped_crossing elements
+            nuscenes_map_data = map_spd_to_nuscenes_ped_crossing(spd_map_data, nuscenes_map_data)
 
-        ## Step 4: generate drivable area elements
-        nuscenes_map_data = map_spd_to_nuscenes_drivable_area(spd_map_data, nuscenes_map_data)
-        
-        ## Step N -1: get canvas_edge
-        nuscenes_map_data = map_spd_to_nuscenes_canvas_edge(nuscenes_map_data)
+            ## Step 4: generate drivable area elements
+            nuscenes_map_data = map_spd_to_nuscenes_drivable_area(spd_map_data, nuscenes_map_data)
+            
+            ## Step N -1: get canvas_edge
+            nuscenes_map_data = map_spd_to_nuscenes_canvas_edge(nuscenes_map_data)
 
-        ## Step N: save map with nuscenes format
-        # Remove duplicated nodes
-        nuscenes_map_data_nodes = []
-        nuscenes_map_data_node_xy = []
-        for node in tqdm(nuscenes_map_data['node']):
-            nuscenes_map_data_node_xy.append((node['x'], node['y']))
-        nuscenes_map_data_node_xy= set(nuscenes_map_data_node_xy)
+            ## Step N: save map with nuscenes format
+            # Remove duplicated nodes
+            try:
+                nuscenes_map_data_nodes = []
+                nuscenes_map_data_node_xy = []
+                for node in tqdm(nuscenes_map_data['node']):
+                    nuscenes_map_data_node_xy.append((node['x'], node['y']))
+                nuscenes_map_data_node_xy = set(nuscenes_map_data_node_xy)
 
-        for xy in tqdm(nuscenes_map_data_node_xy):
-            x, y = xy[0], xy[1]
-            node_token = gen_token('node', str(x), str(y))
-            node_info = {
-                'token': node_token,
-                'x': x,
-                'y': y
-            }
-            nuscenes_map_data_nodes.append(node_info)
-        nuscenes_map_data['node'] = nuscenes_map_data_nodes
+                for xy in tqdm(nuscenes_map_data_node_xy):
+                    x, y = xy[0], xy[1]
+                    node_token = gen_token('node', str(x), str(y))
+                    node_info = {
+                        'token': node_token,
+                        'x': x,
+                        'y': y
+                    }
+                    nuscenes_map_data_nodes.append(node_info)
+                nuscenes_map_data['node'] = nuscenes_map_data_nodes
 
-        if not os.path.exists(save_root):
-            os.makedirs(save_root)
-        save_map_path = os.path.join(save_root, location_name+'.json')
-        write_json(nuscenes_map_data, save_map_path)
+                # Create save directory if it doesn't exist
+                os.makedirs(save_root, exist_ok=True)
+                save_map_path = os.path.join(save_root, location_name+'.json')
+                write_json(nuscenes_map_data, save_map_path)
+            except Exception as e:
+                print(f"Error processing nodes or saving map for {location_name}: {e}")
+                continue
+
+        except Exception as e:
+            print(f"Error converting map for {location_name}: {e}")
+            continue
 
 def parse_args():
     parser = argparse.ArgumentParser(

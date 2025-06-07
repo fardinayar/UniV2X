@@ -85,7 +85,8 @@ class UniV2XTrack(MVXTwoStageDetector):
         save_track_query_file_root='',
         use_multiscale_query=True,
         num_query_scales=3,
-        query_scale_jitter=0.1,
+        query_scale_jitter=0.001,
+        two_stage=True,
     ):
         super(UniV2XTrack, self).__init__(
             img_backbone=img_backbone,
@@ -186,6 +187,16 @@ class UniV2XTrack(MVXTwoStageDetector):
         self.use_multiscale_query = use_multiscale_query
         self.num_query_scales = num_query_scales
         self.query_scale_jitter = query_scale_jitter
+
+        self.two_stage = two_stage
+        if self.two_stage:
+            self.two_stage_bev_feat_proj = nn.Sequential(
+                nn.Linear(self.embed_dims, self.embed_dims),
+                nn.ReLU(inplace=True),
+            )
+            self.two_stage_objectness_head = nn.Linear(self.embed_dims, 1)
+            self.two_stage_reg_head = nn.Linear(self.embed_dims, 2)
+            self.two_stage_query_feat_proj = nn.Linear(self.embed_dims, self.embed_dims)
 
     def _get_multiscale_queries(self, track_instances):
         if not self.use_multiscale_query:
@@ -493,60 +504,78 @@ class UniV2XTrack(MVXTwoStageDetector):
         
         assert bev_embed.shape[0] == self.bev_h * self.bev_w
         return bev_embed, bev_pos
-
     def _get_coop_bev_embed(self, bev_embed_src, bev_pos_src, track_instances, start_idx):
-        """
-        Improve fusion by using Gaussian splatting to project query features onto the BEV grid.
-        This provides a smoother and more principled way of fusing cooperative information.
-        """
-        bev_embed = bev_embed_src
-        bev_pos = bev_pos_src
-        act_track_instances = track_instances[start_idx:]
+        bev_embed = bev_embed_src.clone()
+        bev_pos = bev_pos_src.clone()
+        act_track_instances = track_instances[start_idx:]  
 
-        if len(act_track_instances) == 0:
-            return bev_embed, bev_pos
+        # print('act_track_instances len:',len(act_track_instances))
 
         locs = act_track_instances.ref_pts.sigmoid().clone()
-        locs[:, 0:1] = locs[:, 0:1] * self.bev_w  # w
-        locs[:, 1:2] = locs[:, 1:2] * self.bev_h  # h
+        locs[:, 0:1] = locs[:, 0:1] * self.bev_w # w
+        locs[:, 1:2] = locs[:, 1:2] * self.bev_h # h
 
-        radius = 1  # Radius for Gaussian splatting
-        sigma = radius / 2.0
+        pixel_len = 1 # 2
 
         for idx in range(act_track_instances.ref_pts.shape[0]):
-            w_center, h_center = locs[idx, 0], locs[idx, 1]
-            if w_center >= self.bev_w or w_center < 0 or h_center >= self.bev_h or h_center < 0:
+            w = int(locs[idx, 0])
+            h = int(locs[idx, 1])
+            if w >= self.bev_w or w < 0 or h >= self.bev_h or h < 0:
                 continue
 
-            w_min = max(0, int(w_center - radius))
-            w_max = min(self.bev_w, int(w_center + radius + 1))
-            h_min = max(0, int(h_center - radius))
-            h_max = min(self.bev_h, int(h_center + radius + 1))
-
-            if w_min >= w_max or h_min >= h_max:
-                continue
-
-            patch_w = torch.arange(w_min, w_max, device=locs.device)
-            patch_h = torch.arange(h_min, h_max, device=locs.device)
-            grid_h, grid_w = torch.meshgrid(patch_h, patch_w)
-
-            dist_sq = (grid_w.float() - w_center)**2 + (grid_h.float() - h_center)**2
-            gaussian_weights = torch.exp(-dist_sq / (2 * sigma**2))
-
-            # Update bev_embed
-            feature_embed = self.bev_embed_linear(act_track_instances.query[idx, self.embed_dims:])
-            indices = (grid_h * self.bev_w + grid_w).long().flatten()
-            
-            weighted_feature_embed = gaussian_weights.flatten().view(-1, 1, 1) * feature_embed.view(1, 1, -1)
-            bev_embed.index_add_(0, indices, weighted_feature_embed)
-
-            # Update bev_pos
-            feature_pos = self.bev_pos_linear(act_track_instances.query[idx, :self.embed_dims])
-            weighted_feature_pos = gaussian_weights.view(1, 1, *gaussian_weights.shape) * feature_pos.view(1, -1, 1, 1)
-            bev_pos[:, :, h_min:h_max, w_min:w_max] += weighted_feature_pos
-
+            for hh in range(max(0, h - pixel_len), min(self.bev_h - 1, h + pixel_len)):
+                for ww in range(max(0, w - pixel_len), min(self.bev_w - 1, w + pixel_len)):
+                    bev_embed[hh * self.bev_w + ww, :, :] =  bev_embed[hh * self.bev_w + ww, :, :] + self.bev_embed_linear(act_track_instances.query[idx, self.embed_dims:])
+                    bev_pos[:, :, hh, ww] = bev_pos[:, :, hh, ww] + self.bev_pos_linear(act_track_instances.query[idx, :self.embed_dims])
+ 
         return bev_embed, bev_pos
           
+    def _initialize_inactive_queries(self, track_instances, bev_embed):
+        if not hasattr(self, 'two_stage') or not self.two_stage:
+            return track_instances
+
+        is_inactive = track_instances.obj_idxes == -1
+        inactive_indices = torch.where(is_inactive)[0]
+        num_inactive = len(inactive_indices)
+
+        if num_inactive == 0:
+            return track_instances
+        
+        bev_embed_flat = bev_embed.squeeze(1)
+        bev_features = self.two_stage_bev_feat_proj(bev_embed_flat)
+        objectness = self.two_stage_objectness_head(bev_features)
+        
+        topk = min(num_inactive, len(bev_features))
+        _, topk_indices = torch.topk(objectness.squeeze(-1), k=topk)
+        
+        top_proposals_features = bev_features[topk_indices]
+        new_query_content = self.two_stage_query_feat_proj(top_proposals_features)
+        
+        h, w = self.bev_h, self.bev_w
+        grid_y = (topk_indices.to(torch.float32) // w) / h
+        grid_x = (topk_indices.to(torch.float32) % w) / w
+        
+        offsets = self.two_stage_reg_head(top_proposals_features).sigmoid()
+        ref_x = (grid_x + offsets[:, 0] / w).clamp(0, 1)
+        ref_y = (grid_y + offsets[:, 1] / h).clamp(0, 1)
+
+        ref_z = torch.full_like(ref_x, 0.5)
+        new_ref_pts = torch.stack([ref_x, ref_y, ref_z], dim=-1)
+        new_ref_pts = inverse_sigmoid(new_ref_pts)
+        
+        target_indices_to_update = inactive_indices[:topk]
+        
+        query = track_instances.query.clone()
+        ref_pts = track_instances.ref_pts.clone()
+
+        query[target_indices_to_update, self.embed_dims:] = new_query_content
+        ref_pts[target_indices_to_update] = new_ref_pts
+        
+        track_instances.query = query
+        track_instances.ref_pts = ref_pts
+        
+        return track_instances
+
     @auto_fp16(apply_to=("img", "prev_bev"))
     def _forward_single_frame_train(
         self,
@@ -605,6 +634,8 @@ class UniV2XTrack(MVXTwoStageDetector):
 
                 bev_embed,bev_pos = self._get_coop_bev_embed(bev_embed, bev_pos, track_instances, track_nums_new-add_nums)
         
+        track_instances = self._initialize_inactive_queries(track_instances, bev_embed)
+
         object_query_embeds, ref_points, num_queries_expanded, num_obj_queries = self._get_multiscale_queries(track_instances)
 
         det_output = self.pts_bbox_head.get_detections(
@@ -658,7 +689,9 @@ class UniV2XTrack(MVXTwoStageDetector):
             ref_pts = last_ref_pts[0]
 
         # track_instances.ref_pts = self.reference_points(track_instances.query[..., :dim//2])
-        track_instances.ref_pts[...,:2] = ref_pts[...,:2]
+        new_ref_pts = track_instances.ref_pts.clone()
+        new_ref_pts[..., :2] = ref_pts[..., :2]
+        track_instances.ref_pts = new_ref_pts
 
         track_instances_list.append(track_instances)
         
@@ -682,7 +715,7 @@ class UniV2XTrack(MVXTwoStageDetector):
         active_index = (track_instances.obj_idxes>=0) & (track_instances.iou >= self.gt_iou_threshold) & (track_instances.matched_gt_idxes >=0)
         out.update(self.select_active_track_query(track_instances, active_index, img_metas))
         out.update(self.select_sdc_track_query(track_instances[900], img_metas))
-        out['contrastive_loss'] = contrastive_loss_sum
+        out['contrastive_loss'] = contrastive_loss_sum * 0.01
         
         # memory bank 
         if self.memory_bank is not None:
@@ -764,11 +797,13 @@ class UniV2XTrack(MVXTwoStageDetector):
                 ego2other_rt = other_agent_results[other_agent_name][0]['ego2other_rt']
                 other_agent_pc_range = other_agent_results[other_agent_name][0]['pc_range']
                 track_nums_src = len(track_instances)
-                track_instances = self.cross_agent_query_interaction(other_agent_track_instances, track_instances, ego2other_rt, other_agent_pc_range)
+                track_instances, _ = self.cross_agent_query_interaction(other_agent_track_instances, track_instances, ego2other_rt, other_agent_pc_range)
                 track_nums_new = len(track_instances)
                 add_nums = track_nums_new - track_nums_src
 
                 bev_embed,bev_pos = self._get_coop_bev_embed(bev_embed, bev_pos, track_instances, track_nums_new-add_nums)
+
+        track_instances = self._initialize_inactive_queries(track_instances, bev_embed)
 
         object_query_embeds, ref_points, num_queries_expanded, num_obj_queries = self._get_multiscale_queries(track_instances)
 

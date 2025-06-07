@@ -55,20 +55,32 @@ def generate_instance_json(total_annotations, sample_info_mappings, data_root, v
         category_token_mappings[category_type['name']] = category_type['token']
 
     instance_json_datas = []
-    for instance_token in instance_token_mappings.keys():
-        cur_instance_samples = instance_token_mappings[instance_token]
-        nbr_annotations = len(cur_instance_samples)
-        category_name = cur_instance_samples[0]['annotation']['type']
+    # Only process if we have valid instances
+    if instance_token_mappings:
+        for instance_token in instance_token_mappings.keys():
+            cur_instance_samples = instance_token_mappings[instance_token]
+            if not cur_instance_samples:  # Skip if no samples for this instance
+                continue
+                
+            try:
+                nbr_annotations = len(cur_instance_samples)
+                category_name = cur_instance_samples[0]['annotation']['type']
+                
+                if category_name not in category_token_mappings:  # Skip if category not found
+                    continue
 
-        json_data = {
-            'token': instance_token,
-            'category_token': category_token_mappings[category_name],
-            'nbr_annotations': nbr_annotations,
-            'first_annotation_token': cur_instance_samples[0]['annotation']['token'],
-            'last_annotation_token': cur_instance_samples[nbr_annotations - 1]['annotation']['token']
-        }
+                json_data = {
+                    'token': instance_token,
+                    'category_token': category_token_mappings[category_name],
+                    'nbr_annotations': nbr_annotations,
+                    'first_annotation_token': cur_instance_samples[0]['annotation']['token'],
+                    'last_annotation_token': cur_instance_samples[nbr_annotations - 1]['annotation']['token']
+                }
 
-        instance_json_datas.append(json_data)
+                instance_json_datas.append(json_data)
+            except (KeyError, IndexError):
+                # Skip this instance if there are any issues accessing the data
+                continue
 
     target_file_path = osp.join(data_root, version, 'instance.json')
     write_json(instance_json_datas, target_file_path)
@@ -290,53 +302,78 @@ def generate_sample_annotation_json(total_annotations, data_root, version='v1.0-
     from pyquaternion import Quaternion
 
     sample_annotation_infos = []
+    
+    # Skip if no annotations available
+    if not total_annotations:
+        target_file_path = osp.join(data_root, version, 'sample_annotation.json')
+        write_json(sample_annotation_infos, target_file_path)
+        return
+
     for sample_token in total_annotations.keys():
         annotations = total_annotations[sample_token]
-        scene_token = sample_info_mappings[sample_token]['scene_token']
-        frame_idx = sample_info_mappings[sample_token]['frame_idx']
-        timestamp = sample_info_mappings[sample_token]['timestamp']
+        if not annotations:  # Skip if no annotations for this sample
+            continue
+            
+        try:
+            scene_token = sample_info_mappings[sample_token]['scene_token']
+            frame_idx = sample_info_mappings[sample_token]['frame_idx']
+            timestamp = sample_info_mappings[sample_token]['timestamp']
 
-        for info in spd_infos:
-            if info['token'] == sample_token:
-                sample_lidar2ego_rotation = Quaternion(info['lidar2ego_rotation'])
-                sample_lidar2ego_translation = np.array(info['lidar2ego_translation'])
-                sample_ego2global_rotation = Quaternion(info['ego2global_rotation'])
-                sample_ego2global_translation = np.array(info['ego2global_translation'])
-                break
+            # Find matching spd_info
+            matching_info = None
+            for info in spd_infos:
+                if info['token'] == sample_token:
+                    matching_info = info
+                    break
+                    
+            if not matching_info:  # Skip if no matching info found
+                continue
 
-        for anno_token in annotations.keys():
-            annotation = annotations[anno_token]
+            sample_lidar2ego_rotation = Quaternion(matching_info['lidar2ego_rotation'])
+            sample_lidar2ego_translation = np.array(matching_info['lidar2ego_translation'])
+            sample_ego2global_rotation = Quaternion(matching_info['ego2global_rotation'])
+            sample_ego2global_translation = np.array(matching_info['ego2global_translation'])
 
-            # cvt global
-            center = np.array([annotation['3d_location']['x'], annotation['3d_location']['y'],
-                               annotation['3d_location']['z']])
-            rot = Quaternion(axis=[0, 0, 1], radians=annotation['rotation'])
+            for anno_token in annotations.keys():
+                try:
+                    annotation = annotations[anno_token]
 
-            # lidar2ego
-            center = np.dot(sample_lidar2ego_rotation.rotation_matrix, center) + sample_lidar2ego_translation
-            rot = sample_lidar2ego_rotation * rot
+                    # cvt global
+                    center = np.array([annotation['3d_location']['x'], annotation['3d_location']['y'],
+                                   annotation['3d_location']['z']])
+                    rot = Quaternion(axis=[0, 0, 1], radians=annotation['rotation'])
 
-            # ego2global
-            center = np.dot(sample_ego2global_rotation.rotation_matrix, center) + sample_ego2global_translation
-            rot = sample_ego2global_rotation * rot
+                    # lidar2ego
+                    center = np.dot(sample_lidar2ego_rotation.rotation_matrix, center) + sample_lidar2ego_translation
+                    rot = sample_lidar2ego_rotation * rot
 
-            info = {
-                'token': annotation['token'],
-                'sample_token': sample_token,
-                'instance_token': annotation['instance_token'],
-                'visibility_token': visibility_mappings[annotation['occluded_state']],
-                'attribute_tokens': [],
-                'translation': center.tolist(),
-                'size': [annotation['3d_dimensions']['w'], annotation['3d_dimensions']['l'],
-                         annotation['3d_dimensions']['h']],
-                'rotation': rot.elements.tolist(),
-                'prev': annotation['prev'],
-                'next': annotation['next'],
-                'num_lidar_pts': 100,
-                'num_radar_pts': 0
-            }
+                    # ego2global
+                    center = np.dot(sample_ego2global_rotation.rotation_matrix, center) + sample_ego2global_translation
+                    rot = sample_ego2global_rotation * rot
 
-            sample_annotation_infos.append(info)
+                    info = {
+                        'token': annotation['token'],
+                        'sample_token': sample_token,
+                        'instance_token': annotation['instance_token'],
+                        'visibility_token': visibility_mappings[annotation['occluded_state']],
+                        'attribute_tokens': [],
+                        'translation': center.tolist(),
+                        'size': [annotation['3d_dimensions']['w'], annotation['3d_dimensions']['l'],
+                                annotation['3d_dimensions']['h']],
+                        'rotation': rot.elements.tolist(),
+                        'prev': annotation['prev'],
+                        'next': annotation['next'],
+                        'num_lidar_pts': 100,
+                        'num_radar_pts': 0
+                    }
+
+                    sample_annotation_infos.append(info)
+                except (KeyError, ValueError, TypeError) as e:
+                    # Skip individual annotations that have issues
+                    continue
+        except (KeyError, ValueError, TypeError) as e:
+            # Skip samples that have issues
+            continue
 
     target_file_path = osp.join(data_root, version, 'sample_annotation.json')
     write_json(sample_annotation_infos, target_file_path)

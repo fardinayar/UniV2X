@@ -794,13 +794,23 @@ def _get_total_annotations_coop(root_path,data_infos,sample_info_mappings):
         scene_token = sample_info_mappings[sample_token]['scene_token']
 
         annotation_path = osp.join(root_path, 'cooperative/label', sample_token+'.json')
-        annotations = load_json(annotation_path)
         total_annotations[sample_token] = {}
-        for annotation in annotations:
-            anno_token = annotation['token']
-            annotation["instance_token"] = gen_token(annotation['track_id'],scene_token)
-            annotation['type'] = class_names_nuscenes_mappings[annotation['type']]
-            total_annotations[sample_token][anno_token] = annotation
+        
+        # Skip if annotation file doesn't exist
+        if not osp.exists(annotation_path):
+            continue
+            
+        try:
+            annotations = load_json(annotation_path)
+            for annotation in annotations:
+                anno_token = annotation['token']
+                annotation["instance_token"] = gen_token(annotation['track_id'],scene_token)
+                annotation['type'] = class_names_nuscenes_mappings[annotation['type']]
+                total_annotations[sample_token][anno_token] = annotation
+        except:
+            # Skip if there's any error loading or processing annotations
+            continue
+            
     return total_annotations
 
 def _get_total_annotations(root_path, data_infos, sample_info_mappings):
@@ -812,13 +822,23 @@ def _get_total_annotations(root_path, data_infos, sample_info_mappings):
         timestamp = sample_info_mappings[sample_token]['timestamp']
 
         annotation_path = osp.join(root_path, data_info['label_lidar_std_path'])
-        annotations = load_json(annotation_path)
         total_annotations[sample_token] = {}
-        for annotation in annotations:
-            anno_token = annotation['token']
-            annotation["instance_token"] = gen_token(annotation['track_id'], scene_token)
-            annotation['type'] = class_names_nuscenes_mappings[annotation['type']]
-            total_annotations[sample_token][anno_token] = annotation
+        
+        # Skip if annotation file doesn't exist
+        if not osp.exists(annotation_path):
+            continue
+            
+        try:
+            annotations = load_json(annotation_path)
+            for annotation in annotations:
+                anno_token = annotation['token']
+                annotation["instance_token"] = gen_token(annotation['track_id'], scene_token)
+                annotation['type'] = class_names_nuscenes_mappings[annotation['type']]
+                total_annotations[sample_token][anno_token] = annotation
+        except:
+            # Skip if there's any error loading or processing annotations
+            continue
+            
     return total_annotations
 
 
