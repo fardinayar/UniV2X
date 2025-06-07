@@ -83,148 +83,165 @@ class Visualizer:
     def _parse_predictions_multitask_pkl(self, predroot):
 
         outputs = mmcv.load(predroot)
-        outputs = outputs['bbox_results']
+        # Handle both cases where results can be under 'bbox_results' or 'results' key
+        if 'bbox_results' in outputs:
+            outputs = outputs['bbox_results']
+        elif 'results' in outputs:
+            outputs = outputs['results']
+        else:
+            raise KeyError("Results not found in expected format. Expected 'bbox_results' or 'results' key.")
         prediction_dict = dict()
         for k in range(len(outputs)):
-            token = outputs[k]['token']
-            self.token_set.add(token)
+            try:
+                token = outputs[k]['token']
+                self.token_set.add(token)
 
-            sdc_box = outputs[k]['sdc_boxes_3d']
-            rot_degrees = 90
-            rot_radians = np.radians(rot_degrees)
-            sdc_box.tensor[:, 6] += rot_radians
-            outputs[k]['sdc_boxes_3d'] = sdc_box
+                # Handle case where SDC data might not be present
+                if 'sdc_boxes_3d' in outputs[k]:
+                    sdc_box = outputs[k]['sdc_boxes_3d']
+                    rot_degrees = 90
+                    rot_radians = np.radians(rot_degrees)
+                    sdc_box.tensor[:, 6] += rot_radians
+                    outputs[k]['sdc_boxes_3d'] = sdc_box
 
-            if self.show_sdc_traj:
-                outputs[k]['boxes_3d'].tensor = torch.cat(
-                    [outputs[k]['boxes_3d'].tensor, outputs[k]['sdc_boxes_3d'].tensor], dim=0)
-                outputs[k]['scores_3d'] = torch.cat(
-                    [outputs[k]['scores_3d'], outputs[k]['sdc_scores_3d']], dim=0)
-                outputs[k]['labels_3d'] = torch.cat([outputs[k]['labels_3d'], torch.zeros(
-                    (1,), device=outputs[k]['labels_3d'].device)], dim=0)
-            # detection
-            bboxes = outputs[k]['boxes_3d']
-            scores = outputs[k]['scores_3d']
-            labels = outputs[k]['labels_3d']
+                    if self.show_sdc_traj:
+                        outputs[k]['boxes_3d'].tensor = torch.cat(
+                            [outputs[k]['boxes_3d'].tensor, outputs[k]['sdc_boxes_3d'].tensor], dim=0)
+                        outputs[k]['scores_3d'] = torch.cat(
+                            [outputs[k]['scores_3d'], outputs[k]['sdc_scores_3d']], dim=0)
+                        outputs[k]['labels_3d'] = torch.cat([outputs[k]['labels_3d'], torch.zeros(
+                            (1,), device=outputs[k]['labels_3d'].device)], dim=0)
 
-            track_scores = scores.cpu().detach().numpy()
-            track_labels = labels.cpu().detach().numpy()
-            track_boxes = bboxes.tensor.cpu().detach().numpy()
-
-            track_centers = bboxes.gravity_center.cpu().detach().numpy()
-            track_dims = bboxes.dims.cpu().detach().numpy()
-            track_yaw = bboxes.yaw.cpu().detach().numpy()
-
-            if 'track_ids' in outputs[k]:
-                track_ids = outputs[k]['track_ids'].cpu().detach().numpy()
-            else:
-                track_ids = None
-
-            # speed
-            track_velocity = bboxes.tensor.cpu().detach().numpy()[:, -2:]
-
-            # trajectories
-            trajs = outputs[k][f'traj'].numpy()
-            traj_scores = outputs[k][f'traj_scores'].numpy()
-
-            predicted_agent_list = []
-
-            # occflow
-            if self.with_occ_map:
-                if 'topk_query_ins_segs' in outputs[k]['occ']:
-                    occ_map = outputs[k]['occ']['topk_query_ins_segs'][0].cpu(
-                    ).numpy()
-                else:
-                    occ_map = np.zeros((1, 5, 200, 200))
-            else:
-                occ_map = None
-
-            occ_idx = 0
-            for i in range(track_scores.shape[0]):
-                if track_scores[i] < 0.25:
-                    continue
-                if occ_map is not None and track_labels[i] in self.veh_id_list:
-                    occ_map_cur = occ_map[occ_idx, :, ::-1]
-                    occ_idx += 1
-                else:
-                    occ_map_cur = None
-                if track_ids is not None:
-                    if i < len(track_ids):
-                        track_id = track_ids[i]
-                    else:
-                        track_id = 0
-                else:
-                    track_id = None
-                # if track_labels[i] not in [0, 1, 2, 3, 4, 6, 7]:
-                #     continue
-                predicted_agent_list.append(
-                    AgentPredictionData(
-                        track_scores[i],
-                        track_labels[i],
-                        track_centers[i],
-                        track_dims[i],
-                        track_yaw[i],
-                        track_velocity[i],
-                        trajs[i],
-                        traj_scores[i],
-                        pred_track_id=track_id,
-                        pred_occ_map=occ_map_cur,
-                        past_pred_traj=None
-                    )
-                )
-
-            if self.with_map:
-                map_thres = 0.7
-                score_list = outputs[k]['pts_bbox']['score_list'].cpu().numpy().transpose([
-                    1, 2, 0])
-                predicted_map_seg = outputs[k]['pts_bbox']['lane_score'].cpu().numpy().transpose([
-                    1, 2, 0])  # H, W, C
-                predicted_map_seg[..., -1] = score_list[..., -1]
-                predicted_map_seg = (predicted_map_seg > map_thres) * 1.0
-                predicted_map_seg = predicted_map_seg[::-1, :, :]
-            else:
-                predicted_map_seg = None
-
-            if self.with_planning:
                 # detection
-                bboxes = outputs[k]['sdc_boxes_3d']
-                scores = outputs[k]['sdc_scores_3d']
-                labels = 0
+                bboxes = outputs[k]['boxes_3d']
+                scores = outputs[k]['scores_3d']
+                labels = outputs[k]['labels_3d']
 
                 track_scores = scores.cpu().detach().numpy()
-                track_labels = labels
+                track_labels = labels.cpu().detach().numpy()
                 track_boxes = bboxes.tensor.cpu().detach().numpy()
 
                 track_centers = bboxes.gravity_center.cpu().detach().numpy()
                 track_dims = bboxes.dims.cpu().detach().numpy()
                 track_yaw = bboxes.yaw.cpu().detach().numpy()
+
+                if 'track_ids' in outputs[k]:
+                    track_ids = outputs[k]['track_ids'].cpu().detach().numpy()
+                else:
+                    track_ids = None
+
+                # speed
                 track_velocity = bboxes.tensor.cpu().detach().numpy()[:, -2:]
 
-                if self.show_command:
-                    command = outputs[k]['command'][0].cpu().detach().numpy()
+                # trajectories
+                trajs = outputs[k].get('traj', None)
+                traj_scores = outputs[k].get('traj_scores', None)
+                if trajs is not None:
+                    trajs = trajs.numpy()
+                if traj_scores is not None:
+                    traj_scores = traj_scores.numpy()
+
+                predicted_agent_list = []
+
+                # occflow
+                if self.with_occ_map:
+                    if 'occ' in outputs[k] and 'topk_query_ins_segs' in outputs[k]['occ']:
+                        occ_map = outputs[k]['occ']['topk_query_ins_segs'][0].cpu(
+                        ).numpy()
+                    else:
+                        occ_map = np.zeros((1, 5, 200, 200))
                 else:
-                    command = None
-                planning_agent = AgentPredictionData(
-                    track_scores[0],
-                    track_labels,
-                    track_centers[0],
-                    track_dims[0],
-                    track_yaw[0],
-                    track_velocity[0],
-                    outputs[k]['planning_traj'][0].cpu().detach().numpy(),
-                    1,
-                    pred_track_id=-1,
-                    pred_occ_map=None,
-                    past_pred_traj=None,
-                    is_sdc=True,
-                    command=command,
-                )
-                predicted_agent_list.append(planning_agent)
-            else:
-                planning_agent = None
-            prediction_dict[token] = dict(predicted_agent_list=predicted_agent_list,
-                                          predicted_map_seg=predicted_map_seg,
-                                          predicted_planning=planning_agent)
+                    occ_map = None
+
+                occ_idx = 0
+                for i in range(track_scores.shape[0]):
+                    if track_scores[i] < 0.25:
+                        continue
+                    if occ_map is not None and track_labels[i] in self.veh_id_list:
+                        occ_map_cur = occ_map[occ_idx, :, ::-1]
+                        occ_idx += 1
+                    else:
+                        occ_map_cur = None
+                    if track_ids is not None:
+                        if i < len(track_ids):
+                            track_id = track_ids[i]
+                        else:
+                            track_id = 0
+                    else:
+                        track_id = None
+                    # if track_labels[i] not in [0, 1, 2, 3, 4, 6, 7]:
+                    #     continue
+                    predicted_agent_list.append(
+                        AgentPredictionData(
+                            track_scores[i],
+                            track_labels[i],
+                            track_centers[i],
+                            track_dims[i],
+                            track_yaw[i],
+                            track_velocity[i],
+                            trajs[i] if trajs is not None else None,
+                            traj_scores[i] if traj_scores is not None else None,
+                            pred_track_id=track_id,
+                            pred_occ_map=occ_map_cur,
+                            past_pred_traj=None
+                        )
+                    )
+
+                if self.with_map:
+                    map_thres = 0.7
+                    score_list = outputs[k]['pts_bbox']['score_list'].cpu().numpy().transpose([
+                        1, 2, 0])
+                    predicted_map_seg = outputs[k]['pts_bbox']['lane_score'].cpu().numpy().transpose([
+                        1, 2, 0])  # H, W, C
+                    predicted_map_seg[..., -1] = score_list[..., -1]
+                    predicted_map_seg = (predicted_map_seg > map_thres) * 1.0
+                    predicted_map_seg = predicted_map_seg[::-1, :, :]
+                else:
+                    predicted_map_seg = None
+
+                if self.with_planning and 'sdc_boxes_3d' in outputs[k]:
+                    # detection
+                    bboxes = outputs[k]['sdc_boxes_3d']
+                    scores = outputs[k]['sdc_scores_3d']
+                    labels = 0
+
+                    track_scores = scores.cpu().detach().numpy()
+                    track_labels = labels
+                    track_boxes = bboxes.tensor.cpu().detach().numpy()
+
+                    track_centers = bboxes.gravity_center.cpu().detach().numpy()
+                    track_dims = bboxes.dims.cpu().detach().numpy()
+                    track_yaw = bboxes.yaw.cpu().detach().numpy()
+                    track_velocity = bboxes.tensor.cpu().detach().numpy()[:, -2:]
+
+                    if self.show_command and 'command' in outputs[k]:
+                        command = outputs[k]['command'][0].cpu().detach().numpy()
+                    else:
+                        command = None
+                    planning_agent = AgentPredictionData(
+                        track_scores[0],
+                        track_labels,
+                        track_centers[0],
+                        track_dims[0],
+                        track_yaw[0],
+                        track_velocity[0],
+                        outputs[k].get('planning_traj', [None])[0],
+                        1,
+                        pred_track_id=-1,
+                        pred_occ_map=None,
+                        past_pred_traj=None,
+                        is_sdc=True,
+                        command=command,
+                    )
+                    predicted_agent_list.append(planning_agent)
+                else:
+                    planning_agent = None
+                prediction_dict[token] = dict(predicted_agent_list=predicted_agent_list,
+                                              predicted_map_seg=predicted_map_seg,
+                                              predicted_planning=planning_agent)
+            except Exception as e:
+                print(f"Warning: Failed to process predictions for frame {k}: {str(e)}")
+                continue
         return prediction_dict
 
     def visualize_bev(self, sample_token, out_filename, t=None):
@@ -301,15 +318,15 @@ def main(args):
     render_cfg = dict(
         with_occ_map=False,
         with_map=False,
-        with_planning=True,
+        with_planning=False,
         with_pred_box=True,
-        with_pred_traj=True,
-        show_gt_boxes=True,
+        with_pred_traj=False,
+        show_gt_boxes=False,
         show_lidar=False,
-        show_command=True,
-        show_hd_map=True,
-        show_sdc_car=True,
-        show_legend=True,
+        show_command=False,
+        show_hd_map=False,
+        show_sdc_car=False,
+        show_legend=False,
         show_sdc_traj=False
     )
     # viser = Visualizer(version='v1.0-mini', predroot=args.predroot, dataroot='data/nuscenes', **render_cfg)
@@ -329,11 +346,11 @@ def main(args):
 
     i = 0
     for i in range(len(viser.nusc.sample)):
+        
         sample_token = viser.nusc.sample[i]['token']
         scene_token = viser.nusc.sample[i]['scene_token']
 
-        if scene_token_to_name[scene_token] not in val_splits:
-            continue
+
 
         if sample_token not in viser.token_set:
             print(i, sample_token, 'not in prediction pkl!')
